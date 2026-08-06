@@ -1,0 +1,54 @@
+# Copyright 2026 The Swarmada Authors. Apache-2.0.
+#
+# hardware-fault — the Demo B story. A named component (default camera_front)
+# degrades on a timer (default T+30s); the affected capability degrades and an
+# in-flight FleetTask reroutes. The component self-recovers at a second timer
+# (default T+90s) so the audience sees the full recovery loop. The two timers and
+# the component are overridable from the CLI (--fault-component/--fault-at/--recover-at).
+name: hardware-fault
+description: >
+  camera_front degrades at T+30s (perception.camera → Degraded, in-flight task
+  reroutes) and self-recovers at T+90s. Demo B, scriptable for a live talk.
+
+fleet:
+  size: 1
+  robot_id_prefix: robot-sim
+
+manifest:
+  capabilities:
+    - navigation.2d
+    - perception.camera
+  hardware:
+    - name: lidar_top
+      type: Lidar
+      model: sim-lidar-v1
+    - name: camera_front
+      type: Camera
+      model: sim-cam-v1
+  installed_models: []
+
+battery:
+  start_percent: 100
+  drain_per_second: 0.05
+  floor_percent: 5
+
+position:
+  pattern: patrol
+
+fault_timeline:
+  - component: camera_front
+    at_seconds: 30
+    status: DEGRADED
+    reason: simulated camera degradation
+    affects_capabilities: [perception.camera]
+  - component: camera_front
+    at_seconds: 90
+    status: HEALTHY
+    reason: ""
+    affects_capabilities: [perception.camera]
+
+comms:
+  gaps: []
+
+estop:
+  trigger: none

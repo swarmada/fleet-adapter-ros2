@@ -1,0 +1,38 @@
+# Copyright 2026 The Swarmada Authors. Apache-2.0.
+#
+# battery-edge — one robot starts low and drains fast past FleetTask.spec.minBatteryPct.
+# Shows the scheduler correctly refusing to assign it work and requeuing to a
+# healthy robot. Drives TelemetryPayload.battery.
+name: battery-edge
+description: >
+  One robot starts at low battery and drains fast below a task's minBatteryPct;
+  the scheduler avoids it and requeues the work to a healthy robot.
+
+fleet:
+  size: 1
+  robot_id_prefix: robot-sim
+
+manifest:
+  capabilities:
+    - navigation.2d
+  hardware:
+    - name: lidar_top
+      type: Lidar
+      model: sim-lidar-v1
+  installed_models: []
+
+battery:
+  start_percent: 22      # already near the edge
+  drain_per_second: 1.0  # fast: past a 20% minBatteryPct within a couple of seconds
+  floor_percent: 0
+
+position:
+  pattern: static
+
+fault_timeline: []
+
+comms:
+  gaps: []
+
+estop:
+  trigger: none

@@ -1,0 +1,41 @@
+# Copyright 2026 The Swarmada Authors. Apache-2.0.
+#
+# estop-drill — a confirmed emergency stop after a timer. The adapter brings the
+# robot to a REAL stop via safety.confirm_estop (simulator ground truth, never
+# inferred) and reports the EstopAck-confirmed safe-hold over the SafetyStream. The
+# safety story a healthcare/logistics evaluator will ask about.
+name: estop-drill
+description: >
+  After a timer the robot performs a confirmed emergency stop; the safe-hold is
+  confirmed from the simulator's ground truth (confirm_estop), never faked.
+
+fleet:
+  size: 1
+  robot_id_prefix: robot-sim
+
+manifest:
+  capabilities:
+    - navigation.2d
+    - estop.receive
+  hardware:
+    - name: lidar_top
+      type: Lidar
+      model: sim-lidar-v1
+  installed_models: []
+
+battery:
+  start_percent: 100
+  drain_per_second: 0.05
+  floor_percent: 5
+
+position:
+  pattern: patrol
+
+fault_timeline: []
+
+comms:
+  gaps: []
+
+estop:
+  trigger: at_seconds    # none | on_command | at_seconds
+  at_seconds: 20

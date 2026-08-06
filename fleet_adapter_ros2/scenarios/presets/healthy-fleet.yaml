@@ -1,0 +1,41 @@
+# Copyright 2026 The Swarmada Authors. Apache-2.0.
+#
+# healthy-fleet — the default. N robots, full declared capability set, slow
+# battery drain, no faults. "It just works" for the first five minutes.
+name: healthy-fleet
+description: >
+  N robots register, declare their full capability set, drain battery slowly, and
+  do whatever task they are given. Nothing degrades — the baseline quickstart.
+
+fleet:
+  size: 3
+  robot_id_prefix: robot-sim
+
+manifest:
+  capabilities:
+    - navigation.2d
+    - perception.camera
+  hardware:
+    - name: lidar_top
+      type: Lidar
+      model: sim-lidar-v1
+    - name: camera_front
+      type: Camera
+      model: sim-cam-v1
+  installed_models: []
+
+battery:
+  start_percent: 100
+  drain_per_second: 0.05
+  floor_percent: 5
+
+position:
+  pattern: patrol      # static | line | patrol
+
+fault_timeline: []     # no faults
+
+comms:
+  gaps: []             # no telemetry gaps / stream drops
+
+estop:
+  trigger: none        # none | on_command | at_seconds

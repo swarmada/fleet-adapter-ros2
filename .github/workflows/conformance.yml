@@ -1,0 +1,39 @@
+name: conformance
+on: [push, pull_request]
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"          # swarmada-sdk requires >=3.12
+      # swarmada-sdk isn't on PyPI yet and the conformance harness lives in the
+      # swarmada monorepo — sparse-checkout both from there. This adapter's proto
+      # stubs are vendored here (fleet_adapter/), so it needs no monorepo access
+      # at runtime; the checkout is only for the SDK + harness.
+      - name: Checkout swarmada monorepo (SDK + conformance harness + proto)
+        uses: actions/checkout@v4
+        with:
+          repository: swarmada/swarmada
+          path: swarmada-src
+          sparse-checkout: |
+            sdk/python
+            proto
+            adapters/__init__.py
+            adapters/conformance
+            adapters/scenarios
+          sparse-checkout-cone-mode: false
+      - name: Install
+        run: |
+          pip install -e ./swarmada-src/sdk/python
+          pip install -e '.[dev]' grpcio-tools
+      - name: Safety-wiring tests
+        run: pytest tests/ -v
+      - name: Conformance (C1-C8)
+        working-directory: swarmada-src
+        run: |
+          python -m adapters.conformance \
+            --stub-path proto \
+            --adapter-name fleet-adapter-ros2 \
+            --adapter-cmd 'python3 ${{ github.workspace }}/fleet_adapter_ros2/adapter.py --endpoint localhost:{port} --binding simulated'

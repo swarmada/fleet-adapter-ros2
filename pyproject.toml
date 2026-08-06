@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleet-adapter-ros2"
+version = "0.1.0"
+description = "ROS 2 / Nav2 Fleet Adapter — a Swarmada Fleet Adapter for ros2-nav2"
+authors = [{ name = "The Swarmada Authors <maintainers@swarmada.io>" }]
+license = { text = "Apache-2.0" }
+# Aligned with swarmada-sdk, which this adapter depends on and which now requires >=3.12. The
+# adapter's own dependencies (grpcio, protobuf) still support 3.10; the floor is inherited from the
+# SDK rather than imposed by anything here.
+requires-python = ">=3.12"
+dependencies = [
+  # The audited safety primitives (C3/C4/C5) — never re-implement them.
+  "swarmada-sdk",
+  "grpcio>=1.60",
+  "protobuf>=4.25",
+  "pyyaml>=6.0",  # simulated-binding scenario presets (--scenario)
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.1"]
+
+[project.scripts]
+fleet-adapter-ros2 = "fleet_adapter_ros2.adapter:main"
+
+[tool.setuptools.packages.find]
+include = ["fleet_adapter_ros2*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

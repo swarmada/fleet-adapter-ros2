@@ -1,0 +1,50 @@
+# Copyright 2026 The Swarmada Authors. Apache-2.0.
+#
+# comms-flaky — telemetry gaps on one robot. The adapter suppresses its telemetry
+# stream during each gap, so the control plane sees the outage: staleness detection,
+# and (with a full stream drop) the RegisterRobot reconnect + fencing-token
+# staleness (C3) + lease self-stop (C4) paths. The least "pretty" demo, the most
+# relevant for a distributed-systems reviewer.
+name: comms-flaky
+description: >
+  One robot's telemetry drops out for a window and resumes; exercises the control
+  plane's staleness handling and the adapter's reconnect/lease paths.
+
+fleet:
+  size: 1
+  robot_id_prefix: robot-sim
+
+manifest:
+  capabilities:
+    - navigation.2d
+  hardware:
+    - name: lidar_top
+      type: Lidar
+      model: sim-lidar-v1
+  installed_models: []
+
+battery:
+  start_percent: 100
+  drain_per_second: 0.05
+  floor_percent: 5
+
+position:
+  pattern: patrol
+
+fault_timeline: []
+
+comms:
+  # A full bidirectional ControlStream drop [at_seconds, reconnect_seconds): the
+  # adapter tears the stream down and reconnects, re-running the Hello/Register
+  # handshake. During the outage the control plane's lease renewals stop, so the
+  # adapter self-stops (C4); on reconnect the persisted fencing high-water mark
+  # rejects a stale re-assignment (C3). Telemetry is withheld while the stream is down.
+  #
+  # (A telemetry-only outage — no reconnect — is also supported via `gaps:
+  #  [{start_seconds, end_seconds}]`.)
+  drop:
+    at_seconds: 20
+    reconnect_seconds: 35
+
+estop:
+  trigger: none
