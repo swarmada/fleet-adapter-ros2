@@ -61,6 +61,10 @@ class Nav2Binding:
         self._nav_action = None      # cached nav2_msgs/action/NavigateToPose type
         self._twist_type = None      # cached geometry_msgs/Twist type
         self._spin_thread = None     # rclpy executor thread
+        # Increments on every dispatch. A result callback carries the epoch it was
+        # registered under, so a SUPERSEDED goal's result can be told apart from the
+        # current goal's -- see on_goal_result.
+        self._goal_epoch = 0
 
     # ── ROS 2 subscription callbacks (also the test entry points) ─────────────
 
@@ -119,8 +123,10 @@ class Nav2Binding:
             self._goal_status = 0  # new goal in-flight → RUNNING
             self._nav_initial = None  # progress baseline reset for the new goal
             self._nav_distance = None
+            self._goal_epoch += 1
+            epoch = self._goal_epoch
         if self._node is not None:  # pragma: no cover — requires the ROS 2 runtime
-            self._send_nav2_goal(self._goal)
+            self._send_nav2_goal(self._goal, epoch)
 
     def on_feedback(self, distance_remaining: float) -> None:
         """A NavigateToPose action FeedbackMessage: the remaining distance to the
@@ -176,13 +182,32 @@ class Nav2Binding:
             goal = self._goal
             self._holding = False
             self._goal_status = 0  # re-dispatched goal is in-flight again
+            # The goal cancelled by command_pause will deliver a CANCELED result; it must
+            # not be attributed to the goal being resumed here.
+            self._goal_epoch += 1
+            epoch = self._goal_epoch
         if goal is not None and self._node is not None:  # pragma: no cover — ROS 2 runtime
-            self._send_nav2_goal(goal)
+            self._send_nav2_goal(goal, epoch)
 
-    def on_goal_result(self, status: int) -> None:
+    def on_goal_result(self, status: int, *, epoch: int | None = None) -> None:
         """The NavigateToPose action's terminal ``action_msgs/GoalStatus`` (SUCCEEDED /
-        ABORTED / CANCELED), delivered by the action client's result callback."""
+        ABORTED / CANCELED), delivered by the action client's result callback.
+
+        ``epoch`` identifies the DISPATCH this result belongs to, and a result carrying a
+        stale one is DROPPED. Without it, a superseded goal's result overwrites the status
+        of the goal that replaced it, and the adapter then reports that terminal state
+        against whatever action is currently assigned — observed as ``SUCCEEDED`` at
+        ``progress=100`` for an action assigned 192 ms earlier whose target was 6 m away.
+        On the wire that is indistinguishable from real completion, so the control plane
+        marks the action done and is free to dispatch the next one while the robot is still
+        driving toward the abandoned goal.
+
+        ``epoch=None`` means "unidentified" and is accepted as-is, which keeps this usable
+        as a direct test seam.
+        """
         with self._lock:
+            if epoch is not None and epoch != self._goal_epoch:
+                return
             self._goal_status = status
 
     def task_state(self, robot_id: str) -> str:
@@ -192,7 +217,7 @@ class Nav2Binding:
             status = self._goal_status
         return task_map.task_state_from_goal_status(status)
 
-    def _send_nav2_goal(self, goal: task_map.GoalPose) -> None:  # pragma: no cover — ROS 2 runtime
+    def _send_nav2_goal(self, goal: task_map.GoalPose, epoch: int) -> None:  # pragma: no cover — ROS 2 runtime
         # Build a NavigateToPose goal (PoseStamped, yaw→quaternion) and dispatch it
         # via the action client; feedback → on_feedback (progress), result → on_goal_result.
         import math
@@ -213,17 +238,23 @@ class Nav2Binding:
         self._action_client.wait_for_server()
         send_future = self._action_client.send_goal_async(
             nav_goal, feedback_callback=self._on_nav_feedback)
-        send_future.add_done_callback(self._on_goal_response)
+        send_future.add_done_callback(lambda f: self._on_goal_response(f, epoch))
 
-    def _on_goal_response(self, future) -> None:  # pragma: no cover — ROS 2 runtime
+    def _on_goal_response(self, future, epoch: int) -> None:  # pragma: no cover — ROS 2 runtime
         handle = future.result()
         if not handle.accepted:
-            self.on_goal_result(6)  # ABORTED — the Nav2 server rejected the goal
+            self.on_goal_result(6, epoch=epoch)  # ABORTED — the Nav2 server rejected it
             return
         with self._lock:
+            if epoch != self._goal_epoch:
+                # Superseded before the server answered. Do NOT adopt this handle: a later
+                # command_stop() would then cancel the WRONG goal, leaving the current one
+                # running. Its result is dropped too — it says nothing about the goal now
+                # in flight.
+                return
             self._goal_handle = handle
         handle.get_result_async().add_done_callback(
-            lambda f: self.on_goal_result(f.result().status))  # action_msgs/GoalStatus
+            lambda f: self.on_goal_result(f.result().status, epoch=epoch))
 
     def _on_nav_feedback(self, feedback_msg) -> None:  # pragma: no cover — ROS 2 runtime
         # NavigateToPose feedback carries distance_remaining → progress baseline.
@@ -262,6 +293,8 @@ class Nav2Binding:
         Nav2 stack (it cannot be exercised without one). The `$0` path never reaches
         here — every dispatch is guarded by `self._node is not None`."""
         try:
+            import atexit
+            import sys
             import threading
 
             import rclpy
@@ -270,6 +303,7 @@ class Nav2Binding:
             from nav_msgs.msg import Odometry
             from nav2_msgs.action import NavigateToPose
             from rclpy.action import ActionClient
+            from rclpy.executors import ExternalShutdownException
             from rclpy.node import Node
             from sensor_msgs.msg import BatteryState
         except ImportError as exc:
@@ -293,5 +327,53 @@ class Nav2Binding:
         self._twist_type = Twist
         self._node = node
 
-        self._spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+        def _spin() -> None:
+            try:
+                rclpy.spin(node)
+            except ExternalShutdownException:
+                pass                     # stop() shut the context down: the clean path
+            except Exception as exc:     # noqa: BLE001 - a boundary, not a handler
+                # NOT a fault-reporting design: this only stops a
+                # dying spin thread from printing a traceback; the adapter still does not
+                # notice it has gone blind. That remains open.
+                print(f"rclpy spin thread exited: {exc!r}", file=sys.stderr)
+
+        self._spin_thread = threading.Thread(target=_spin, daemon=True)
         self._spin_thread.start()
+        # Every caller -- the adapter's main(), r1/r2 smoke, the latency script -- creates a
+        # binding and never tears it down. Registering here fixes all of them at once with
+        # no Protocol change; stop() is idempotent so an explicit call remains fine.
+        atexit.register(self.stop)
+
+    def stop(self) -> None:  # pragma: no cover — requires the ROS 2 runtime
+        """Shut the executor down and join the spin thread BEFORE the interpreter tears
+        the C++ side out from under it.
+
+        Without this, ``rclpy.spin`` runs on a daemon thread that the interpreter kills at
+        exit while it is inside a C++ frame. The C++ runtime then unwinds a thread with no
+        active exception, calls ``std::terminate``, and the process dies on SIGABRT --
+        **exit 134 on a run whose work completed successfully**. Every smoke test, the
+        latency script and both conformance containers ended that way.
+
+        Idempotent, and safe to call when :meth:`start` was never called.
+
+        Deliberately a method on the CONCRETE binding and NOT added to the ``RobotBinding``
+        Protocol: whether the Protocol should declare a lifecycle is an open
+        question, and this does not answer it.
+        """
+        node, thread = self._node, self._spin_thread
+        self._node, self._spin_thread = None, None
+        if node is None:
+            return
+        import rclpy
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()   # makes rclpy.spin() return in the spin thread
+        except Exception:          # noqa: BLE001 - teardown must not raise
+            pass
+        if thread is not None:
+            thread.join(timeout=5.0)
+        try:
+            node.destroy_node()
+        except Exception:          # noqa: BLE001 - teardown must not raise
+            pass
