@@ -42,9 +42,11 @@ class _EstopAck:
     # "inferred, not confirmed" case the estop protocol forbids. Keep this fake in
     # step with the real message: it silently diverged once already, which is how
     # the ActionState rename passed these tests while failing the real harness.
-    def __init__(self, estop_id="", state=0, message="", stop_initiated_at=None):
+    def __init__(self, estop_id="", state=0, message="", stop_initiated_at=None,
+                 confirmed_at_ms=None):
         self.estop_id, self.state, self.message = estop_id, state, message
         self.stop_initiated_at = stop_initiated_at
+        self.confirmed_at_ms = confirmed_at_ms
 
 
 class _SafetyMsg:
@@ -60,7 +62,7 @@ class _Msg:
 class _FakePB:
     HARDWARE_STATUS_UNSPECIFIED, HARDWARE_STATUS_HEALTHY = 0, 1
     HARDWARE_STATUS_DEGRADED, HARDWARE_STATUS_FAILED = 2, 3
-    ESTOP_STATE_UNSPECIFIED, ESTOP_STATE_STOPPED, ESTOP_STATE_FAILED = 0, 1, 2
+    ESTOP_STATE_UNSPECIFIED, ESTOP_STATE_STOPPING, ESTOP_STATE_STOPPED, ESTOP_STATE_FAILED = 0, 1, 2, 3
     HardwareStatusUpdate = _HW
     HardwareComponent = _HWComponent
     CapabilitiesSnapshot = _CapsSnapshot
@@ -100,7 +102,11 @@ def test_capabilities_snapshot_carries_the_manifest() -> None:
     assert all(c.status == _FakePB.HARDWARE_STATUS_HEALTHY for c in msg.capabilities.hardware)
 
 
-def test_estop_drill_emits_confirmed_ack_once() -> None:
+def test_estop_drill_acks_the_command_before_confirming_the_stop() -> None:
+    """The estop SLA bounds the FIRST acknowledgement, not the confirmed one -- a
+    real base takes longer than the SLA to reach confirmed rest. So the drill must
+    emit a STOPPING ack the moment the stop is commanded, and only emit the STOPPED
+    ack once rest is confirmed from odometry (C5.3 unweakened)."""
     adapter = _adapter("estop-drill")
     adapter._robot.command_move("robot-sim-1", 5.0, 0.0)
     adapter._robot._elapsed = 10.0
@@ -109,8 +115,16 @@ def test_estop_drill_emits_confirmed_ack_once() -> None:
 
     adapter._robot._elapsed = 21.0
     adapter._maybe_estop_drill()
-    msg = adapter._safety_outbox.get_nowait()
-    assert msg.estop_ack.state == _FakePB.ESTOP_STATE_STOPPED
+
+    stopping = adapter._safety_outbox.get_nowait()
+    assert stopping.estop_ack.state == _FakePB.ESTOP_STATE_STOPPING
+    assert stopping.estop_ack.stop_initiated_at is not None
+    assert stopping.estop_ack.confirmed_at_ms is None  # not confirmed yet
+
+    stopped = adapter._safety_outbox.get_nowait()
+    assert stopped.estop_ack.state == _FakePB.ESTOP_STATE_STOPPED
+    assert stopped.estop_ack.confirmed_at_ms is not None
+    assert stopped.estop_ack.stop_initiated_at == stopping.estop_ack.stop_initiated_at
     assert adapter._robot.is_stopped("robot-sim-1")  # ground truth: actually at rest
 
     adapter._maybe_estop_drill()

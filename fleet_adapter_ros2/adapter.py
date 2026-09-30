@@ -32,6 +32,8 @@ from swarmada_sdk.safety import (  # noqa: E402
     FenceDecision,
     FenceGuard,
     LeaseMonitor,
+    await_estop_confirmation,
+    command_estop,
     confirm_estop,
 )
 
@@ -413,8 +415,12 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             snapshot_ms=int(time.time() * 1000))))
 
     def _maybe_estop_drill(self) -> None:
-        """estop-drill: once due, bring the robot to a REAL confirmed stop via
-        confirm_estop (never inferred) and report the EstopAck. Fires once."""
+        """estop-drill: once due, bring the robot to a REAL confirmed stop. The estop
+        SLA bounds the FIRST acknowledgement, not the confirmed one (see
+        command_estop's docstring) -- so this commands the stop and reports
+        ESTOP_STATE_STOPPING immediately, then confirms rest via
+        await_estop_confirmation (never inferred) and reports the final EstopAck.
+        Fires once."""
         if self._sim is None or self._estop_drilled or not self._sim.estop_due():
             return
         self._estop_drilled = True
@@ -425,12 +431,20 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # "inferred, not confirmed" case the estop protocol forbids.
         initiated_ms = int(time.time() * 1000)
         with self._robot_lock:
-            state = confirm_estop(self._robot, self._robot_id)  # C5 discipline: never faked
+            command_estop(self._robot, self._robot_id)
+            self._safety_outbox.put(pb.AdapterSafetyMessage(
+                robot_id=self._robot_id, estop_ack=pb.EstopAck(
+                    estop_id=f"drill-{self._robot_id}",
+                    stop_initiated_at=initiated_ms,
+                    state=pb.ESTOP_STATE_STOPPING,
+                    message="stop commanded; confirming rest from odometry")))
+            state = await_estop_confirmation(self._robot, self._robot_id)  # C5 discipline: never faked
         self._current_action = ""  # safe-hold: drop the task, like a real estop
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id, estop_ack=pb.EstopAck(
                 estop_id=f"drill-{self._robot_id}",
                 stop_initiated_at=initiated_ms,
+                confirmed_at_ms=int(time.time() * 1000),
                 state=(pb.ESTOP_STATE_STOPPED if state == ESTOP_STOPPED
                        else pb.ESTOP_STATE_FAILED),
                 message="estop drill (scenario)")))
