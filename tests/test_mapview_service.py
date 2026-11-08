@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import http.client
 import json
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -262,13 +263,29 @@ def test_the_browser_viewer_checks_and_draws_what_the_service_streams(server, tm
                                "--virtual-time-budget=3000", "--dump-dom",
                                f"http://127.0.0.1:{port}/?robot={R}"],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    # Chrome's start-up time varies (seconds on a loaded runner), so the service is closed only
+    # once the page's stream is open, never after a fixed wait: closed earlier, the page's first
+    # request is refused (503) and it draws nothing. The DOM is read on a thread so that a
+    # Chrome that never writes it cannot hang the test past its deadline.
+    out: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: [out.put(ln) for ln in chrome.stdout] + [out.put(None)],
+                     daemon=True).start()
     try:
-        time.sleep(4)
+        deadline = time.monotonic() + 60
+        while chrome.poll() is None and time.monotonic() < deadline:
+            with view._lock:
+                if view._viewers.get(R):
+                    break
+            time.sleep(0.05)
+        time.sleep(0.5)                       # the replay is written; let the page take it
         view.close()
-        dom, deadline = "", time.monotonic() + 60
+        dom = ""
         while "</html>" not in dom and time.monotonic() < deadline:
-            chunk = chrome.stdout.readline()
-            if not chunk and chrome.poll() is not None:
+            try:
+                chunk = out.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if chunk is None:
                 break
             dom += chunk
     finally:
