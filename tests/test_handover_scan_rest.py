@@ -90,10 +90,12 @@ class ScanBrakingRobot(base.BrakingRobot):
         return ho.SimulatedHandoverRobot.is_stopped(self, robot_id)
 
     def pump(self) -> None:
-        """Every scan due by now, cast from where the plant truly was."""
+        """Every scan due by now, cast from where the plant truly was. The clock is read again
+        for each scan: casting a backlog takes real time (about 9 ms a scan), and a lidar keeps
+        publishing meanwhile, so the newest scan is never older than one period when this
+        returns, however long the stand-in went unpumped."""
         with self._scan_lock:
-            now = self._clock()
-            while self._next <= now:
+            while self._next <= self._clock():
                 self.feed_scan(self._lidar.cast(self._plant, self._next), self._next + 0.005)
                 self._plant.step(0.1)
                 self._next += 0.1
