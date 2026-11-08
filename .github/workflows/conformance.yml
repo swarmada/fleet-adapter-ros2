@@ -16,6 +16,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: swarmada/swarmada
+          # The release this adapter is qualified against. Without a ref the checkout takes
+          # swarmada's main, and this workflow's result changes whenever the harness moves.
+          ref: rfc-0001-v0.4
           path: swarmada-src
           sparse-checkout: |
             sdk/python
@@ -30,7 +33,7 @@ jobs:
           pip install -e '.[dev]' grpcio-tools
       - name: Safety-wiring tests
         run: pytest tests/ -v
-      - name: Conformance (C1-C8)
+      - name: Conformance (RFC-0001 v0.4, suite 2026.10.22.2)
         working-directory: swarmada-src
         run: |
           python -m adapters.conformance \
