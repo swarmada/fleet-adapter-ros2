@@ -16,10 +16,12 @@ class _Pb:
     ACTION_STATE_RUNNING = 1
     ACTION_STATE_SUCCEEDED = 2
     ACTION_STATE_FAILED = 3
+    ACTION_END_CAUSE_EXECUTION_FAILURE = 6
 
     class ActionStatusUpdate:
-        def __init__(self, action_id="", state=0, progress_pct=0):
+        def __init__(self, action_id="", state=0, progress_pct=0, message="", end_cause=0):
             self.action_id, self.state, self.progress_pct = action_id, state, progress_pct
+            self.message, self.end_cause = message, end_cause
             self.fencing_token = None
 
     class AdapterMessage:
@@ -69,7 +71,9 @@ def test_streams_failed() -> None:
     a._current_action = "t1"
     a._last_task_state = task.TASK_RUNNING
     a._maybe_emit_task_progress()
-    assert _drain(a._outbox)[0].action_status.state == _Pb.ACTION_STATE_FAILED
+    upd = _drain(a._outbox)[0].action_status
+    assert upd.state == _Pb.ACTION_STATE_FAILED
+    assert upd.end_cause == _Pb.ACTION_END_CAUSE_EXECUTION_FAILURE  # the goal ended in failure
 
 
 def test_cancelled_goal_is_not_streamed_here() -> None:

@@ -1,0 +1,14 @@
+# Synthetic plant transcript for tests/test_plant_probe.py:
+# the lidar mount (two tf2_echo translations and the URDF's joints).
+# Written for this repository by a script, from a session on the test robot; not a capture.
+# It holds only the lines the probe's parsers and the tests read, laid out the way the
+# commands print them. The numbers are the ones the robot reported.
+
+$ ros2 run tf2_ros tf2_echo base_footprint lidar_frame
+- Translation: [-0.012, -0.000, 0.163]
+
+$ ros2 run tf2_ros tf2_echo base_link lidar_frame
+- Translation: [-0.012, -0.000, 0.093]
+
+$ ros2 param get /robot_state_publisher robot_description
+String value is: <?xml version="1.0" ?><robot name="synthetic_plant_fixture"><joint name="imu_joint" type="fixed"><parent link="base_link" /><child link="imu_link" /><origin xyz="0 0 0" rpy="0 0 -1.57" /></joint><joint name="base_footprint_to_base_link" type="fixed"><parent link="base_footprint" /><child link="base_link" /><origin xyz="0 0 0.07" rpy="0 0 0" /></joint><joint name="wheel_lf_Joint" type="continuous"><parent link="base_link" /><child link="wheel_lf_Link" /><origin xyz="0.067052 0.07591 -0.018408" rpy="0 0 0" /></joint><joint name="wheel_rf_Joint" type="continuous"><parent link="base_link" /><child link="wheel_rf_Link" /><origin xyz="0.067052 -0.07591 -0.018408" rpy="0 0 0" /></joint><joint name="wheel_lb_Joint" type="continuous"><parent link="base_link" /><child link="wheel_lb_Link" /><origin xyz="-0.06764 0.07591 -0.018414" rpy="0 0 0" /></joint><joint name="wheel_rb_Joint" type="continuous"><parent link="base_link" /><child link="wheel_rb_Link" /><origin xyz="-0.067621 -0.07591 -0.018408" rpy="0 0 0" /></joint><joint name="cam_Joint" type="fixed"><parent link="base_link" /><child link="depth_cam" /><origin xyz="0.061376 -0.00013463 0.051154" rpy="0 0 0" /></joint><joint name="lidar_Joint" type="fixed"><parent link="base_link" /><child link="lidar_frame" /><origin xyz="-0.012242 -8.533E-05 0.092501" rpy="0 0 0" /></joint></robot>

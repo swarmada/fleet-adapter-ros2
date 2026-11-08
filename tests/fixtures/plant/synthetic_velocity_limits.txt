@@ -1,0 +1,11 @@
+# Synthetic plant transcript for tests/test_plant_probe.py:
+# the velocity smoother's live limits, read with Nav2 running.
+# Written for this repository by a script, from a session on the test robot; not a capture.
+# It holds only the lines the probe's parsers and the tests read, laid out the way the
+# commands print them. The numbers are the ones the robot reported.
+
+$ ros2 param get /velocity_smoother max_velocity
+Double values are: array('d', [0.35, 0.0, 1.0])
+
+$ ros2 param get /velocity_smoother max_decel
+Double values are: array('d', [-2.5, 0.0, -3.2])

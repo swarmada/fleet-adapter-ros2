@@ -1,0 +1,57 @@
+# Names the public-surface gate has to know, kept out of the gate's own prose.
+#
+# `scripts/check-error-strings.py` reads this file. Two kinds of name live here, and
+# neither could be written into the checker as a literal:
+#
+#   [unpublished-trees]   repositories and directories this project does not publish.
+#                         A sentence that sends a reader to one of them sends them
+#                         nowhere. The gate has to recognise the name to refuse it,
+#                         and this file is itself scanned -- so every entry is a
+#                         REGULAR EXPRESSION whose first character is bracketed:
+#                         `[x]yz` matches exactly the text `xyz` and costs nothing,
+#                         while the literal string never appears here. This is the
+#                         same trick the checker uses for the two words it forbids,
+#                         and for the same reason: a rule that cannot state itself
+#                         without breaking itself is not enforceable.
+#
+#   [unreachable-links]   links and trailers that point at a work session, a
+#                         conversation or an unpublished artifact. These resolve to a
+#                         sign-in page for anyone outside the account that made them,
+#                         which is worse than no reference: it looks like provenance a
+#                         reviewer could check. Bracketed like the trees above, and for
+#                         the same reason. `Co-Authored-By` and `Signed-off-by` are NOT
+#                         in here and must not be: each names a person or a model, which
+#                         is attribution, not a place a reader is being sent.
+#
+#   [public-handles]      short uppercase-plus-digit tokens that ARE published, and
+#                         must therefore survive the work-session handle rule. These
+#                         need no bracketing: they are allowed, so spelling them is
+#                         the point. Each is matched whole (`fullmatch`) against one
+#                         token, so `C\d{1,2}` covers the conformance cases without
+#                         one line each.
+#
+# Format:  <regex> :: <why>, in one line. The separator is not a pipe,
+# because half of these patterns are alternations and a pipe would cut the
+# first branch off every one of them. Blank lines and #-comments are ignored.
+# A section that is empty, missing, or unparseable is a hard error in the checker,
+# not a silent pass: an allow-list that quietly reads as empty turns the handle rule
+# into noise, and a tree list that quietly reads as empty turns it off.
+
+[unpublished-trees]
+[s]warmada_origin :: this project's development monorepo. Nothing in it is published; a reader outside the project cannot clone it, so a sentence that says where a change landed "over there" points at nothing they can open
+[s]warmada-demo :: the workspace tree this repository is checked out inside. It is a local arrangement of one machine, not a published layout
+[G]olandProjects :: a workspace directory on a developer's machine. Like the rule above it, an instruction routed through it cannot be followed by anyone else -- and unlike an absolute home path it carries no `/Users` prefix to be caught by
+
+[unreachable-links]
+[C]laude-Session:[^\n]* :: a trailer naming the work session a commit was written in. Nobody outside the account that ran it can open the session, so the line offers a reviewer a reference and then refuses it. The maintainer's ruling of 2026-09-21 is that it comes off the published branch; the attribution trailers beside it stay
+[c]laude\.ai/(?:code/)?(?:session|chat|artifact)s?[_/][A-Za-z0-9_-]+ :: a link to a work session, a conversation or an unpublished artifact, wherever it appears rather than only in a trailer. A reader outside the account gets a sign-in page
+
+[public-handles]
+C\d{1,2} :: the conformance cases C0 through C17. Published: the adapter registry (`adapters/REGISTRY.md`) names C17.1 through C17.4 by number, and this repository's own conformance notes grade against the same list
+R[123] :: the testbed rungs, and the two hardware qualification runs a public reader can look up. ADR-0067 defines R1 (confirmed-stop deceleration interval) and R2 (cancel to confirmed-rest latency) by name and cites their runbook; `testbed/README.md` publishes R1 and R2 step by step and `testbed/R3.md` publishes R3
+ROS2|NAV2 :: the robot middleware and the navigation stack, under the names their own packages and environment variables spell without the space
+P5 :: the netpbm magic number for a binary greyscale image, written into every PGM map this testbed generates
+A10|L4|L40|T4|K80 :: GPU model names from the vendor's catalogue, read by `testbed/cloud_bootstrap.sh` to accept or refuse a rented box
+PB2 :: the suffix the protobuf compiler gives every module it generates, and part of the filename of both vendored stubs
+STEP\d{1,2} :: a numbered step of the R1 runbook, which `testbed/README.md` publishes step by step; `r1_step5_probe.py` is named after the step it drives
+AWS4 :: the name of AWS Signature Version 4 as the protocol spells it: every signed object-store request carries the algorithm AWS4-HMAC-SHA256, and the signing key is derived from "AWS4" followed by the secret. The object-store client cannot sign without writing it

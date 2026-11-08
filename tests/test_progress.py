@@ -8,7 +8,6 @@ climbs during a task. Terminal 100% is the completion-stream's job."""
 
 from __future__ import annotations
 
-from fleet_adapter_ros2 import task
 from fleet_adapter_ros2.adapter import fleet_adapter_ros2Adapter as Adapter
 from fleet_adapter_ros2.nav2_binding import Nav2Binding
 from fleet_adapter_ros2.robot import SimulatedRobot

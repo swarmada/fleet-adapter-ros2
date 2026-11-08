@@ -1,0 +1,127 @@
+# Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# R2-TIER CONFORMANCE — the full adapter against a REAL Nav2 stack.
+#
+# Neither existing configuration is the one that matters:
+#
+#   r2_smoke.py        drives Nav2Binding directly            -> a BINDING test; the
+#                                                                adapter's protocol layer
+#                                                                is never exercised
+#   `conformance` in   drives the full adapter, but points it -> a PROTOCOL test against a
+#   docker-compose.yml at the ACTIVE fake robot's own            fake action server; no
+#                      NavigateToPose server                     planner, no costmap, no
+#                                                                recovery behaviours
+#
+# This file is the missing one:
+#
+#   conformance harness
+#     -> fleet_adapter_ros2.adapter --binding ros2      (the FULL adapter)
+#        -> Nav2 (planner / controller / behaviors / smoother / collision_monitor)
+#           -> fake_robot_node.py --passive             (Nav2 owns the wheels)
+#           +  r2_sensors.py                            (TF + /scan)
+#
+# The fake robot MUST be --passive here: it surrenders its own NavigateToPose server so
+# Nav2 is the only action server, and two controllers are not fighting over /cmd_vel.
+# That is why this reuses `r2-robot` (passive) and not `fake-robot` (active).
+#
+# USE
+#   cd testbed
+#   SWARMADA_CORE=/path/to/swarmada \
+#     docker compose -f docker-compose.yml -f docker-compose.r2-conformance.yml \
+#       --profile r2 --profile r2conf up --build \
+#       --abort-on-container-exit --exit-code-from r2-conformance \
+#       r2-robot r2-sensors nav2 r2-conformance
+#
+# Report lands at testbed/conformance-r2.json -- deliberately NOT conformance-live.json,
+# so the fake-server result stays intact for comparison.
+
+services:
+
+  # Nav2 needs a params file that configures all ten managed nodes.
+  # Since the fold, nav2_params.yaml is that file -- there is no second params
+  # file and no override to pass.
+  nav2:
+    command:
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        exec ros2 launch nav2_bringup navigation_launch.py \
+          use_sim_time:=false \
+          autostart:=true \
+          params_file:=/ws/testbed/nav2_params.yaml
+
+  r2-conformance:
+    profiles: [r2conf]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: swarmada/ros2-testbed:jazzy
+    container_name: tb-r2-conformance
+    depends_on: [r2-robot, r2-sensors, nav2]
+    working_dir: /ws/core
+    networks: [ros]
+    # Verbatim from the `conformance` service in docker-compose.yml. PYTHONPATH is the
+    # load-bearing line: everything is imported from the MOUNTS, never installed.
+    #   /ws/core                -> `python -m adapters.conformance`, and proto/
+    #   /ws/core/sdk/python/src -> swarmada_sdk (adapter.py needs it)
+    #   /ws/adapter             -> fleet_adapter_ros2
+    # The harness spawns the adapter as a subprocess, which inherits this.
+    environment:
+      ROS_DOMAIN_ID: "42"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /ws/core:/ws/core/sdk/python/src:/ws/adapter
+    volumes:
+      - ../:/ws/adapter:rw
+      - ./:/ws/testbed:rw
+      - ${SWARMADA_CORE:?set SWARMADA_CORE=/path/to/swarmada}:/ws/core:rw
+    command:
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        # Nav2's lifecycle activation is not instant and the conformance run assigns a
+        # goal within its first seconds. The `conformance` service waits 4s because a
+        # fake action server is up immediately; Nav2 needs far longer. r2_smoke uses 20s
+        # after its own compose-level wait, so match that budget here.
+        sleep 40
+        exec python3 -m adapters.conformance \
+          --stub-path proto \
+          --adapter-name fleet-adapter-ros2-nav2 \
+          --json /ws/testbed/conformance-r2.json \
+          --adapter-cmd 'python3 -m fleet_adapter_ros2.adapter --endpoint localhost:{port} --binding ros2 --stall-window 30.0 --stall-min-progress 0.25 --goal-response-bound 1.0 --odometry-source measured'
+    # --odometry-source is THIS plant's too: fake_robot_node.py integrates its own pose and
+    # velocity from an acceleration-limited model and publishes THAT as /odom. The model goes
+    # on reporting motion after a stop is commanded, for as long as it takes the model to
+    # brake -- it does not echo the command back -- so it is the independent channel ADR-0071
+    # requires and a STOPPED read from it is a confirmation (CONFORMANCE.md C5.3). Declared,
+    # not assumed: on a base whose drive controller republishes the velocity command as
+    # odometry, the same topic reads zero the instant a stop is commanded and every confirmed
+    # stop is an echo of the stop command, so `--binding ros2` refuses to start without the
+    # declaration. A SIMULATED run confirming rest says nothing about a physical platform.
+    # --stall-window / --stall-min-progress are THIS plant's: r2-robot (fake_robot_node.py
+    # --passive --decel 1.0, so --accel 1.0) driven by Nav2 with nav2_params.yaml and the
+    # default behaviour tree of the image's nav2_bt_navigator 1.3.13,
+    # navigate_to_pose_w_replanning_and_recovery.xml (nav2_params.yaml names no other).
+    # The window must outlast Nav2's own first round of handling a lack of progress, so
+    # that Nav2, not the adapter, handles every stall Nav2 is configured to handle:
+    #   10.0 s  controller progress checker: FollowPath fails after movement_time_allowance
+    #           without required_movement_radius 0.5 m
+    #   10.0 s  the tree's inner retry: clear the local costmap, FollowPath once more
+    #    5.0 s  the longest outer recovery action: Wait wait_duration 5.0. Spin 1.57 rad
+    #           is at most 3.9 s even at behavior_server min_rotational_vel 0.4 rad/s, and
+    #           BackUp 0.30 m at 0.15 m/s is 2.0 s (both limits read from the running stack)
+    #    4.14 s a turn in place back onto the path: <= pi rad at the velocity smoother's
+    #           1.0 rad/s, ramping at the plant's 1.0 rad/s^2 (pi + 1.0)
+    #    0.71 s the first 0.25 m from rest at 1.0 m/s^2: sqrt(2 * 0.25 / 1.0)
+    #   = 29.85 s < 30.0 s. After that round the adapter cancels; Nav2 would go on retrying
+    #   (number_of_retries 6), and whether it or the adapter should own that is open.
+    # min progress: xy_goal_tolerance 0.25 m, the least approach Nav2's goal checker
+    #   distinguishes, and five 0.05 m cells of path-length jitter when it replans at 1 Hz.
+    # --goal-response-bound: how long Nav2's bt_navigator takes to answer a NavigateToPose
+    #   goal. Measured through this service, once: 2 answers, 2.4 ms and 13.5 ms. That is a
+    #   thin sample; 1.0 s is far above it, and is half the 2.0 s confirmed-stop budget, so a
+    #   stop commanded while a goal is unanswered still has 1.0 s to observe rest after the
+    #   goal is abandoned. Re-measure before relying on it on a loaded host.

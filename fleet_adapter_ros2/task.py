@@ -32,6 +32,9 @@ TASK_CANCELLED = "ACTION_STATE_CANCELLED"
 # lapses (C4.2) or an estop safe-holds the action, so the control plane can tell
 # "stopped on purpose" from "crashed" and from silence.
 TASK_STOPPED = "ACTION_STATE_STOPPED"
+# The adapter cannot say what became of the action: reported when the control plane's
+# authoritative state for this robot is UNKNOWN on reconnect (C2.2).
+TASK_UNKNOWN = "ACTION_STATE_UNKNOWN"
 
 # action_msgs/msg/GoalStatus status codes (the Nav2 goal's in-flight/terminal state).
 _GS_ACCEPTED, _GS_EXECUTING = 1, 2

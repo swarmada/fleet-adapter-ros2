@@ -1,0 +1,324 @@
+# Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# R1/R2 testbed. All services share one DDS domain.
+#
+# NOTE ON NETWORKING: DDS discovery uses multicast, which does NOT cross Docker's
+# default bridge reliably. `network_mode: host` is the fix on Linux. On macOS,
+# Docker Desktop has no true host network, so every ROS process must live in the
+# SAME compose network AND the same ROS_DOMAIN_ID -- which is what this file does.
+# If discovery still fails, see the runbook's "DDS discovery" section.
+
+name: ros2-testbed
+
+x-ros-env: &ros-env
+  ROS_DOMAIN_ID: "42"
+  RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+  PYTHONUNBUFFERED: "1"
+  # The adapter checkout is mounted at /ws/adapter; make it importable.
+  PYTHONPATH: /ws/adapter
+
+x-base-common: &base-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: swarmada/ros2-testbed:jazzy
+  environment: *ros-env
+  volumes:
+    # The adapter source under test. Adjust the left side if your checkout differs.
+    - ../:/ws/adapter:rw
+    - ./:/ws/testbed:rw
+  working_dir: /ws
+
+# Bridge-network services (R1/R2). `networks` lives HERE and not in *base-common because
+# Compose REJECTS any service carrying both `networks` and `network_mode: host` -- and the
+# rejection invalidates the WHOLE project, not just that service. With `networks` in the
+# shared anchor, the host-mode r3 services inherited it and every command that loads the
+# r3 profile failed, INCLUDING `docker compose --profile r3 down --remove-orphans`. That
+# made routine cleanup impossible today, long before anyone runs R3.
+# Host-network services merge *base-common instead.
+x-base: &base
+  <<: *base-common
+  networks: [ros]
+
+services:
+
+  # ---- R1 -----------------------------------------------------------------
+
+  # The robot: publishes /odom, /battery_state, /diagnostics; serves
+  # NavigateToPose; integrates /cmd_vel into the odometry it reports.
+  fake-robot:
+    <<: *base
+    container_name: tb-fake-robot
+    # ROBOT_ARGS lets a fault case be selected without editing anything:
+    #   ROBOT_ARGS="--reject-goals"   make r1
+    #   ROBOT_ARGS="--goal-outcome abort" make r1
+    #   ROBOT_ARGS="--stall-after 3.0" make r1
+    #   ROBOT_ARGS="--decel 0.3"      make r1
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+                python3 /ws/testbed/fake_robot_node.py ${ROBOT_ARGS:---decel 1.0}"
+
+  # The R1 assertion run. Drives Nav2Binding directly -- no control plane.
+  r1-smoke:
+    <<: *base
+    container_name: tb-r1-smoke
+    depends_on: [fake-robot]
+    # ROBOT_ARGS is passed through to the HARNESS as well as the robot.
+    # Without it r1_smoke.py cannot know which fault case the robot was started with,
+    # and a harness that cannot see its own condition cannot refuse to score it --
+    # which is how `ALL R1 ASSERTIONS PASSED` came to be printed for faults that
+    # never fired. The default must match fake-robot's default above, or the gate
+    # would be reasoning about a different run than the one executing.
+    environment:
+      <<: *ros-env
+      ROBOT_ARGS: ${ROBOT_ARGS:---decel 1.0}
+      # R1 NOW NEEDS swarmada_sdk, and the reason is the point.
+      # r1_smoke.py used to call `Nav2Binding.start()` itself, so it never imported
+      # `adapter.py` and never needed the SDK -- see the conformance service below, whose
+      # comment recorded exactly that ("nav2_binding does not, which is why the smoke test
+      # passed without it"). That independence WAS the defect: the harness brought the
+      # binding up by hand while the shipped adapter did not, so R1 was green against a
+      # transport `--binding ros2` had never opened. Bring-up now goes through
+      # `adapter.bring_up_robot()`, so R1 imports what the adapter imports.
+      PYTHONPATH: /ws/adapter:/ws/core/sdk/python/src
+    volumes:
+      - ../:/ws/adapter:rw
+      - ./:/ws/testbed:rw
+      - ${SWARMADA_CORE:?set SWARMADA_CORE=/path/to/swarmada}:/ws/core:ro
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+                sleep 4 &&
+                python3 /ws/testbed/r1_smoke.py"
+
+  # ---- Conformance against a LIVE ROS 2 runtime ---------------------------
+  # The harness launches the FULL adapter against a stub control plane, so it can
+  # observe what a binding-level smoke test structurally cannot: goal rejection,
+  # ABORTED, terminal task status, the safety stream. It has only ever been run
+  # with `--binding simulated`; pointing it at `--binding ros2` with fake-robot up
+  # is exactly what REGISTRY.md's "no live ROS 2/Nav2 runtime yet" refers to.
+  #
+  #   SWARMADA_CORE=/path/to/swarmada \
+  #     docker compose --profile conformance up --abort-on-container-exit \
+  #       --exit-code-from conformance fake-robot conformance
+  #
+  # Pair with a fault case:  ROBOT_ARGS="--goal-outcome abort" ...
+  conformance:
+    <<: *base
+    container_name: tb-conformance
+    profiles: [conformance]
+    depends_on: [fake-robot]
+    working_dir: /ws/core
+    environment:
+      ROS_DOMAIN_ID: "42"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      PYTHONUNBUFFERED: "1"
+      # Everything is imported from the MOUNTS, never installed.
+      #   /ws/core                  -> `python -m adapters.conformance`, and proto/
+      #   /ws/core/sdk/python/src   -> swarmada_sdk (adapter.py needs it; nav2_binding alone
+      #                                does not. The smoke test used to run without it, which
+      #                                is now understood as a SYMPTOM rather than a
+      #                                convenience: it meant R1 never touched adapter.py, so
+      #                                it could not notice the adapter never started the
+      #                                binding. r1-smoke carries this mount too.)
+      #   /ws/adapter               -> fleet_adapter_ros2
+      # The harness spawns the adapter as a subprocess, which inherits this.
+      #
+      # `make deps` pip-installs into a `docker compose run --rm` container, so its
+      # effects vanish with that container -- it is a VERIFICATION step, not an install.
+      PYTHONPATH: /ws/core:/ws/core/sdk/python/src:/ws/adapter
+    volumes:
+      - ../:/ws/adapter:rw
+      - ./:/ws/testbed:rw
+      - ${SWARMADA_CORE:?set SWARMADA_CORE=/path/to/swarmada}:/ws/core:rw
+    command:
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        sleep 4
+        exec python3 -m adapters.conformance \
+          --stub-path proto \
+          --adapter-name fleet-adapter-ros2-live \
+          --json /ws/testbed/conformance-live.json \
+          --adapter-cmd 'python3 -m fleet_adapter_ros2.adapter --endpoint localhost:{port} --binding ros2 --stall-window 5.0 --stall-min-progress 0.10 --goal-response-bound 1.0 --odometry-source measured'
+    # --odometry-source is THIS plant's too: fake_robot_node.py integrates its own pose and
+    # velocity from an acceleration-limited model and publishes THAT as /odom. The model goes
+    # on reporting motion after a stop is commanded, for as long as it takes the model to
+    # brake -- it does not echo the command back -- so it is the independent channel ADR-0071
+    # requires and a STOPPED read from it is a confirmation (CONFORMANCE.md C5.3). Declared,
+    # not assumed: on a base whose drive controller republishes the velocity command as
+    # odometry, the same topic reads zero the instant a stop is commanded and every confirmed
+    # stop is an echo of the stop command, so `--binding ros2` refuses to start without the
+    # declaration. A SIMULATED run confirming rest says nothing about a physical platform.
+    # --stall-window / --stall-min-progress are THIS plant's: the ACTIVE fake robot as
+    # fake-robot above starts it by default (--decel 1.0; --accel defaults to --decel;
+    # --cruise 0.5), with fake_robot_node.py's own turn-then-drive controller. --binding ros2
+    # refuses to start without them, because no robot's values are anyone else's.
+    #   window: the longest the distance to go can legitimately stay flat is a turn in place
+    #     before driving: at most pi rad at TURN_SPEED 1.0 rad/s, ramping at 1.0 rad/s^2 up
+    #     and down (1.0 s each), so <= pi + 1.0 = 4.14 s; then the first 0.10 m from rest at
+    #     1.0 m/s^2, sqrt(2 * 0.10 / 1.0) = 0.45 s. 4.59 s < 5.0 s. Feedback starts within
+    #     one 0.05 s tick of acceptance, so the wait for it adds nothing measurable.
+    #   min progress: GOAL_TOLERANCE, 0.10 m, the least approach this node distinguishes.
+    # A ROBOT_ARGS that slows the ramps is a different plant and needs its own values: with
+    # --decel 0.3 the same turn is 2 * sqrt(pi / 0.3) = 6.5 s (triangular, peak < 1.0 rad/s)
+    # plus 0.82 s for the first 0.10 m, so the window must exceed 7.3 s.
+    # --goal-response-bound is THIS server's too: how long fake_robot_node.py's action server
+    # takes to answer a goal. Measured through this service (85 runs, 496 goal answers):
+    # median 4 ms, 99th percentile 11 ms, maximum 0.629 s, none lost. 1.0 s is above that
+    # maximum, and is half the 2.0 s confirmed-stop budget, so a stop commanded while a goal
+    # is unanswered still has 1.0 s to observe rest after the goal is abandoned; this plant
+    # brakes from its 0.5 m/s cruise in 0.5 s. Another server is a different measurement.
+
+  # ---- R2 -----------------------------------------------------------------
+  # The SAME fake robot, unmodified. R2 adds a second node (r2_sensors) that
+  # supplies the TF tree and the laser scan Nav2 needs -- so nothing about the
+  # R1 robot changes, and an R1 regression stays an R1 regression.
+  r2-robot:
+    <<: *base
+    container_name: tb-r2-robot
+    profiles: [r2]
+    # NOTE: `--decel` here is the plant's deceleration, and
+    # r2_cancel_latency.py needs it to compute the kinematic floor that rejects a
+    # physically impossible stop. The script cannot read this flag, so it carries its
+    # own default in run_verdict.DEFAULT_DECEL. CHANGE BOTH TOGETHER -- a mismatch
+    # makes the floor wrong in the permissive direction, which is the silent one.
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+                python3 /ws/testbed/fake_robot_node.py --decel 1.0 --passive"
+
+  # TF (map -> odom -> base_link -> laser) + a raycast /scan against the map.
+  # Subscribes /odom; publishes nothing the robot itself owns.
+  r2-sensors:
+    <<: *base
+    container_name: tb-r2-sensors
+    profiles: [r2]
+    depends_on: [r2-robot]
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+                python3 /ws/testbed/r2_sensors.py --map /ws/testbed/map/warehouse.yaml"
+
+  # WHY `command: |` AND NOT `command: >` -- this cost a whole R2 run.
+  #
+  # A YAML FOLDED scalar (`>`) folds newlines to spaces ONLY for lines at the same
+  # indent as the first. Any line indented MORE keeps its newline. A multi-line
+  # argument list is therefore more-indented, so the newlines survive into the
+  # string handed to `bash -lc`, where a newline TERMINATES a command:
+  #
+  #     source ... &&              <- `&&` continues onto the next line: fine
+  #     ros2 launch ... .py        <- bare newline: THE COMMAND ENDS HERE
+  #       params_file:=...         <- a separate shell command, never reached
+  #
+  # Nav2 came up with ZERO arguments on its packaged defaults: no params_file, a
+  # static_layer with no map_server behind it, MPPI instead of RegulatedPurePursuit,
+  # and a different velocity_smoother ceiling -- while `ps` still showed the full
+  # string, so it looked correct from outside. Use a LITERAL block (`|`), one shell
+  # command per line, backslash-continued argument lists. This is the form the
+  # `conformance` service already uses, which is why that one always worked.
+  nav2:
+    <<: *base
+    container_name: tb-nav2
+    profiles: [r2]
+    depends_on: [r2-robot]
+    command:
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        exec ros2 launch nav2_bringup navigation_launch.py \
+          use_sim_time:=false \
+          autostart:=true \
+          params_file:=/ws/testbed/nav2_params.yaml
+
+  r2-smoke:
+    <<: *base
+    container_name: tb-r2-smoke
+    profiles: [r2]
+    depends_on: [nav2]
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+                sleep 20 &&
+                python3 /ws/testbed/r2_smoke.py"
+
+  # ---- R3 -----------------------------------------------------------------
+  # Isaac Sim replaces r2-robot AND r2-sensors. Nav2 and the assertions are
+  # carried over unchanged -- only use_sim_time flips, because Isaac owns /clock.
+  # Run this on the GPU box, with Isaac already up (see R3.md section 4).
+  nav2-r3:
+    <<: *base-common
+    container_name: tb-nav2-r3
+    profiles: [r3]
+    network_mode: host          # the Linux GPU box HAS a host network; your Mac does not
+    command:                    # literal block, NOT `>` -- see the nav2 service above
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        exec ros2 launch nav2_bringup navigation_launch.py \
+          use_sim_time:=true \
+          autostart:=true \
+          params_file:=/ws/testbed/nav2_params.r3.yaml
+
+  # ---- R3 · VDA5050 robot -------------------------------------------------
+  # The third protocol. Robot 2 in the SAME Isaac scene, authored by the SAME
+  # Action Graph as the ROS 2 robots -- only what listens on the far end differs.
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: tb-mqtt
+    profiles: [r3]
+    network_mode: host
+    # Literal block, NOT `>`: a folded scalar preserves the newline on the
+    # more-indented line, so printf wrote the config to the CONTAINER LOG and
+    # `> /m.conf` then truncated an EMPTY file. mosquitto 2.x with no listener and
+    # allow_anonymous defaulting to false refuses every connection.
+    command:
+      - sh
+      - -c
+      - |
+        printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' > /m.conf
+        exec mosquitto -c /m.conf
+
+  # Isaac ROS 2 topics  <->  VDA5050 MQTT. The only new code in the demo.
+  vda5050-shim:
+    <<: *base-common
+    container_name: tb-vda5050-shim
+    profiles: [r3]
+    network_mode: host
+    depends_on: [mosquitto]
+    command:                    # literal block, NOT `>` -- see the nav2 service above
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        exec python3 /ws/testbed/vda5050_shim.py \
+          --robot-ns /robot2 --mqtt-host localhost \
+          --manufacturer swarmada --serial amr-1
+
+  # The real adapter, unmodified, against a real broker.
+  vda5050-adapter:
+    <<: *base-common
+    container_name: tb-vda5050-adapter
+    profiles: [r3]
+    network_mode: host
+    depends_on: [vda5050-shim]
+    volumes:
+      - ../:/ws/adapter:rw
+      - ./:/ws/testbed:rw
+      - ${VDA5050_ADAPTER:-../../fleet-adapter-vda5050}:/ws/vda5050:rw
+    command:                    # literal block, NOT `>` -- see the nav2 service above
+      - bash
+      - -lc
+      - |
+        source /opt/ros/jazzy/setup.bash
+        cd /ws/vda5050
+        sleep 8
+        exec python3 -m fleet_adapter_vda5050.adapter \
+          --comms vda5050 --mqtt-host localhost --mqtt-port 1883 \
+          --manufacturer swarmada --serial amr-1 \
+          --endpoint $${SWARMADA_ENDPOINT:-localhost:9090}
+
+networks:
+  ros:
+    driver: bridge

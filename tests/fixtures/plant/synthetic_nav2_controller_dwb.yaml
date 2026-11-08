@@ -1,0 +1,16 @@
+# Synthetic Nav2 parameter fixture for tests/test_plant_probe.py:
+# a DWB controller; no footprint_model or min_obstacle_dist.
+# Written for this repository; not a configuration for any robot. It holds only the
+# keys the plant probe's parser reads (testbed/probe/plant_fields.py), laid out the way
+# Nav2 expects them. The numbers are the ones the test robot reported, so the parser tests
+# can still be checked against the captured live parameter dump in room-and-limits.txt.
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    controller_plugins:
+    - FollowPath
+    FollowPath:
+      plugin: dwb_core::DWBLocalPlanner
+      max_vel_x: 0.6
+      max_vel_theta: 1.0
+      acc_lim_x: 2.5

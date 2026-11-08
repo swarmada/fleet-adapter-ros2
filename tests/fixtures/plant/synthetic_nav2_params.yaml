@@ -1,0 +1,41 @@
+# Synthetic Nav2 parameter fixture for tests/test_plant_probe.py:
+# velocity smoother and both costmaps, with no footprint key.
+# Written for this repository; not a configuration for any robot. It holds only the
+# keys the plant probe's parser reads (testbed/probe/plant_fields.py), laid out the way
+# Nav2 expects them. The numbers are the ones the test robot reported, so the parser tests
+# can still be checked against the captured live parameter dump in room-and-limits.txt.
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      robot_radius: 0.05
+      robot_base_frame: base_footprint
+      inflation_layer:
+        inflation_radius: 0.25
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      robot_radius: 0.05
+      robot_base_frame: base_footprint
+      inflation_layer:
+        inflation_radius: 0.25
+velocity_smoother:
+  ros__parameters:
+    max_velocity:
+    - 0.35
+    - 0.0
+    - 1.0
+    min_velocity:
+    - -0.35
+    - 0.0
+    - -1.0
+    max_accel:
+    - 2.5
+    - 0.0
+    - 3.2
+    max_decel:
+    - -2.5
+    - 0.0
+    - -3.2
+    feedback: OPEN_LOOP
+    odom_topic: odom
+    smoothing_frequency: 20.0
