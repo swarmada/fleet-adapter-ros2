@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace as NS
 
+import pytest
+
+from conftest import mark_transport_live
 from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED, confirm_estop
 
 from fleet_adapter_ros2.nav2_binding import Nav2Binding
@@ -58,9 +61,14 @@ def test_command_stop_cancels_goal_and_holds() -> None:
     assert b.is_stopped("amr-1") is False
 
 
+# `confirm_estop` polls `tick()`, and `tick()` now refuses an un-started transport,
+# so these two fixtures must say that their transport is up. They always
+# MEANT a live robot — feeding `on_odom` is standing in for the subscription — and they
+# passed before only because the binding could not tell it had never been started.
+
 def test_confirm_estop_returns_stopped_when_odom_confirms_rest() -> None:
     # confirm_estop → command_stop, then polls is_stopped; odom shows rest → STOPPED.
-    b = Nav2Binding(robot_id="amr-1")
+    b = mark_transport_live(Nav2Binding(robot_id="amr-1"))
     b.on_odom(_odom(vx=0.0, wz=0.0))
     assert confirm_estop(b, "amr-1") == ESTOP_STOPPED
 
@@ -68,9 +76,25 @@ def test_confirm_estop_returns_stopped_when_odom_confirms_rest() -> None:
 def test_confirm_estop_fails_when_robot_still_moving() -> None:
     # The stop is commanded but odom still shows motion → FAILED, never a false
     # STOPPED. This is the C5.3 guarantee: rest is confirmed, not assumed.
-    b = Nav2Binding(robot_id="amr-1")
+    b = mark_transport_live(Nav2Binding(robot_id="amr-1"))
     b.on_odom(_odom(vx=0.5))
     assert confirm_estop(b, "amr-1", tick_dt=0.0, max_ticks=5) == ESTOP_FAILED
+
+
+def test_confirm_estop_on_an_unstarted_binding_raises_rather_than_failing_quietly() -> None:
+    """The un-started state, on the safety path. An un-started binding's `is_stopped()`
+    is False forever, so `confirm_estop` used to return FAILED — the right answer for the
+    wrong reason, and with no way for anyone to learn the reason. That is what C5.2 /
+    C8.3 / C14.1 failed on for weeks while the cause was attributed elsewhere.
+
+    `tick()` now raises instead, naming the cause. The adapter converts this back into
+    an `EstopAck(FAILED)` so the control plane still gets its answer — see
+    `test_binding_lifecycle.py` — but the binding's job is to stop being silent.
+    """
+    b = Nav2Binding(robot_id="amr-1")          # NOT marked live: never started
+    b.on_odom(_odom(vx=0.0, wz=0.0))           # would otherwise confirm rest
+    with pytest.raises(RuntimeError, match="NEVER STARTED"):
+        confirm_estop(b, "amr-1", tick_dt=0.0, max_ticks=5)
 
 
 def test_new_goal_releases_hold() -> None:

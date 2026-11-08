@@ -77,6 +77,27 @@ def position_from_odom(odom, floor: int = 0) -> Position:
                     floor=floor)
 
 
+def transform_from_tf(tf) -> Position:
+    """``geometry_msgs/TransformStamped`` (what ``tf2_ros.Buffer.lookup_transform``
+    returns) → the planar transform it carries, as a Position (translation + yaw)."""
+    t = tf.transform.translation
+    r = tf.transform.rotation
+    return Position(x=float(t.x), y=float(t.y),
+                    yaw=yaw_from_quaternion(float(r.x), float(r.y), float(r.z), float(r.w)))
+
+
+def compose(parent_from_child: Position, pose: Position) -> Position:
+    """A planar pose in the child frame, expressed in the parent frame: rotate by the
+    transform's yaw, then translate. ``floor`` is the pose's own; yaw is wrapped to
+    (-pi, pi]."""
+    c, s = math.cos(parent_from_child.yaw), math.sin(parent_from_child.yaw)
+    yaw = math.atan2(math.sin(pose.yaw + parent_from_child.yaw),
+                     math.cos(pose.yaw + parent_from_child.yaw))
+    return Position(x=parent_from_child.x + c * pose.x - s * pose.y,
+                    y=parent_from_child.y + s * pose.x + c * pose.y,
+                    yaw=yaw, floor=pose.floor)
+
+
 def speed_from_odom(odom) -> tuple[float, float]:
     """``nav_msgs/Odometry`` → (linear_speed, angular_speed) magnitudes, in m/s and
     rad/s. This is the robot's measured motion — the ground truth a confirmed stop
@@ -120,13 +141,27 @@ def _status_from_level(level: int) -> str:
     return STATUS_FAILED  # ERROR or STALE
 
 
+def _level_to_int(level) -> int:
+    """``DiagnosticStatus.level`` is an IDL ``byte``; rclpy surfaces it as a
+    single-byte ``bytes`` (``b"\\x00"``), not an ``int`` — and ``int(b"\\x00")``
+    raises ``ValueError``. Accept both, so the mapping works against a live ROS 2
+    runtime AND against the int-typed fakes in tests/test_telemetry.py.
+
+    Found by the first live-runtime run: the raise happened inside the rclpy
+    executor callback and killed the spin thread, after which the adapter served
+    stale telemetry indefinitely."""
+    if isinstance(level, (bytes, bytearray)):
+        return level[0] if level else _DIAG_OK
+    return int(level)
+
+
 def hardware_from_diagnostics(diag) -> list[Hardware]:
     """``diagnostic_msgs/DiagnosticArray`` → per-component Hardware. Only the level
     (→ status enum) and the bounded message (→ reason) cross the boundary; the
     arbitrary key/value pairs are intentionally dropped (numeric-only rule)."""
     out: list[Hardware] = []
     for s in getattr(diag, "status", []):
-        status = _status_from_level(int(getattr(s, "level", _DIAG_OK)))
+        status = _status_from_level(_level_to_int(getattr(s, "level", _DIAG_OK)))
         reason = "" if status == STATUS_HEALTHY else str(getattr(s, "message", ""))
         out.append(Hardware(component_name=str(s.name), status=status, reason=reason))
     return out

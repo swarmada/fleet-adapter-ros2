@@ -93,5 +93,5 @@ def test_binding_caches_and_maps_telemetry() -> None:
 def test_binding_defaults_before_any_message() -> None:
     b = Nav2Binding(robot_id="amr-1", floor=3)
     assert b.pose("amr-1") == (0.0, 0.0, 3)   # floor default, no odom yet
-    assert b.battery_percent("amr-1") == 0
+    assert b.battery_percent("amr-1") is None  # never read: unknown, never a 0 (C6.2)
     assert b.latest_hardware("amr-1") == []

@@ -5,8 +5,10 @@ import warnings
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as fleet__adapter_dot_v1_dot_fleet__adapter__pb2
 
-GRPC_GENERATED_VERSION = '1.81.1'
+GRPC_GENERATED_VERSION = '1.64.1'
 GRPC_VERSION = grpc.__version__
+EXPECTED_ERROR_RELEASE = '1.65.0'
+SCHEDULED_RELEASE_DATE = 'June 25, 2024'
 _version_not_supported = False
 
 try:
@@ -16,16 +18,19 @@ except ImportError:
     _version_not_supported = True
 
 if _version_not_supported:
-    raise RuntimeError(
+    warnings.warn(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in fleet_adapter/v1/fleet_adapter_pb2_grpc.py depends on'
+        + f' but the generated code in fleet_adapter/v1/fleet_adapter_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
+        + f' This warning will become an error in {EXPECTED_ERROR_RELEASE},'
+        + f' scheduled for release on {SCHEDULED_RELEASE_DATE}.',
+        RuntimeWarning
     )
 
 
-class FleetAdapterServiceStub:
+class FleetAdapterServiceStub(object):
     """═══════════════════════════════════════════════════════════════════════════
     FleetAdapterService — adapter-initiated bidirectional stream topology
 
@@ -33,8 +38,8 @@ class FleetAdapterServiceStub:
 
     The control plane is the gRPC SERVER. Each Fleet Adapter is the CLIENT: it
     dials the control plane and opens two long-lived bidirectional streams:
-    ControlStream  — all operational traffic (actions, telemetry, heartbeat)
-    SafetyStream   — emergency-stop only (RFC-0001 #fleet-adapter-protocol-why-grpc-and-why-adapter-initiated-bidirectional-streams RA-6; see SafetyStream RPC)
+    ControlStream — all operational traffic (actions, telemetry, heartbeat)
+    SafetyStream — emergency-stop only (RFC-0001 #fleet-adapter-protocol-why-grpc-and-why-adapter-initiated-bidirectional-streams RA-6; see SafetyStream RPC)
     This topology is simultaneously:
     * NAT/firewall friendly — robots and adapters never need a routable address
     or an inbound listener (a hard requirement on warehouse/hospital Wi-Fi); and
@@ -55,8 +60,8 @@ class FleetAdapterServiceStub:
     (FleetAdapter.spec.servesRobotClasses + namespace) — there is no per-robot JWT.
 
     SAFETY HARDENING (carried over from the Stage-2 proto pass):
-    * fencing tokens on AssignAction/CancelAction (anti double-execution, R2/RA-2);
-    * adapter-CONFIRMED estop via EstopAck.state (never telemetry-inferred, R4);
+    * fencing tokens on AssignAction/CancelAction (anti double-execution);
+    * adapter-CONFIRMED estop via EstopAck.state (never telemetry-inferred);
     * proto3 explicit-presence (`optional`) on safety-relevant scalars (RA-3b).
     ═══════════════════════════════════════════════════════════════════════════
 
@@ -80,7 +85,7 @@ class FleetAdapterServiceStub:
                 _registered_method=True)
 
 
-class FleetAdapterServiceServicer:
+class FleetAdapterServiceServicer(object):
     """═══════════════════════════════════════════════════════════════════════════
     FleetAdapterService — adapter-initiated bidirectional stream topology
 
@@ -88,8 +93,8 @@ class FleetAdapterServiceServicer:
 
     The control plane is the gRPC SERVER. Each Fleet Adapter is the CLIENT: it
     dials the control plane and opens two long-lived bidirectional streams:
-    ControlStream  — all operational traffic (actions, telemetry, heartbeat)
-    SafetyStream   — emergency-stop only (RFC-0001 #fleet-adapter-protocol-why-grpc-and-why-adapter-initiated-bidirectional-streams RA-6; see SafetyStream RPC)
+    ControlStream — all operational traffic (actions, telemetry, heartbeat)
+    SafetyStream — emergency-stop only (RFC-0001 #fleet-adapter-protocol-why-grpc-and-why-adapter-initiated-bidirectional-streams RA-6; see SafetyStream RPC)
     This topology is simultaneously:
     * NAT/firewall friendly — robots and adapters never need a routable address
     or an inbound listener (a hard requirement on warehouse/hospital Wi-Fi); and
@@ -110,8 +115,8 @@ class FleetAdapterServiceServicer:
     (FleetAdapter.spec.servesRobotClasses + namespace) — there is no per-robot JWT.
 
     SAFETY HARDENING (carried over from the Stage-2 proto pass):
-    * fencing tokens on AssignAction/CancelAction (anti double-execution, R2/RA-2);
-    * adapter-CONFIRMED estop via EstopAck.state (never telemetry-inferred, R4);
+    * fencing tokens on AssignAction/CancelAction (anti double-execution);
+    * adapter-CONFIRMED estop via EstopAck.state (never telemetry-inferred);
     * proto3 explicit-presence (`optional`) on safety-relevant scalars (RA-3b).
     ═══════════════════════════════════════════════════════════════════════════
 
@@ -121,9 +126,9 @@ class FleetAdapterServiceServicer:
         """ControlStream is the primary persistent connection. The adapter opens it
         and sends AdapterHello first; the control plane replies with HelloAck.
         Thereafter both sides multiplex:
-        adapter → control plane : AdapterMessage  (register/discover, telemetry,
+        adapter → control plane: AdapterMessage (register/discover, telemetry,
         action status, command results, heartbeat replies)
-        control plane → adapter : ControlPlaneMessage (acks, pushed Commands,
+        control plane → adapter: ControlPlaneMessage (acks, pushed Commands,
         heartbeat requests)
         NOTE: Estop/EstopAck travel on SafetyStream, NOT on ControlStream.
         Command.estop (field 5) and CommandResult.estop (field 6) are retained for
@@ -184,7 +189,7 @@ def add_FleetAdapterServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class FleetAdapterService:
+class FleetAdapterService(object):
     """═══════════════════════════════════════════════════════════════════════════
     FleetAdapterService — adapter-initiated bidirectional stream topology
 
@@ -192,8 +197,8 @@ class FleetAdapterService:
 
     The control plane is the gRPC SERVER. Each Fleet Adapter is the CLIENT: it
     dials the control plane and opens two long-lived bidirectional streams:
-    ControlStream  — all operational traffic (actions, telemetry, heartbeat)
-    SafetyStream   — emergency-stop only (RFC-0001 #fleet-adapter-protocol-why-grpc-and-why-adapter-initiated-bidirectional-streams RA-6; see SafetyStream RPC)
+    ControlStream — all operational traffic (actions, telemetry, heartbeat)
+    SafetyStream — emergency-stop only (RFC-0001 #fleet-adapter-protocol-why-grpc-and-why-adapter-initiated-bidirectional-streams RA-6; see SafetyStream RPC)
     This topology is simultaneously:
     * NAT/firewall friendly — robots and adapters never need a routable address
     or an inbound listener (a hard requirement on warehouse/hospital Wi-Fi); and
@@ -214,8 +219,8 @@ class FleetAdapterService:
     (FleetAdapter.spec.servesRobotClasses + namespace) — there is no per-robot JWT.
 
     SAFETY HARDENING (carried over from the Stage-2 proto pass):
-    * fencing tokens on AssignAction/CancelAction (anti double-execution, R2/RA-2);
-    * adapter-CONFIRMED estop via EstopAck.state (never telemetry-inferred, R4);
+    * fencing tokens on AssignAction/CancelAction (anti double-execution);
+    * adapter-CONFIRMED estop via EstopAck.state (never telemetry-inferred);
     * proto3 explicit-presence (`optional`) on safety-relevant scalars (RA-3b).
     ═══════════════════════════════════════════════════════════════════════════
 
@@ -276,10 +281,10 @@ class FleetAdapterService:
             _registered_method=True)
 
 
-class EdgeServiceStub:
+class EdgeServiceStub(object):
     """---------------------------------------------------------------------------
     EdgeService — served by the Zone Controller EDGE NODE on the facility LAN,
-    not by the control plane (RA-10-D1, RFC-0001 #fleet-adapter-protocol-the-edge-stream, RFC-0001 #safety-edge-headless-emergency-stop). The adapter dials
+    not by the control plane (RFC-0001 #fleet-adapter-protocol-the-edge-stream, RFC-0001 #safety-edge-headless-emergency-stop). The adapter dials
     every endpoint listed in RegisterAck.edge_endpoints and holds one EdgeStream
     per edge node, with the same dial-out, mTLS, and reconnect-backoff
     discipline as the ControlStream. The stream survives control-plane
@@ -300,10 +305,10 @@ class EdgeServiceStub:
                 _registered_method=True)
 
 
-class EdgeServiceServicer:
+class EdgeServiceServicer(object):
     """---------------------------------------------------------------------------
     EdgeService — served by the Zone Controller EDGE NODE on the facility LAN,
-    not by the control plane (RA-10-D1, RFC-0001 #fleet-adapter-protocol-the-edge-stream, RFC-0001 #safety-edge-headless-emergency-stop). The adapter dials
+    not by the control plane (RFC-0001 #fleet-adapter-protocol-the-edge-stream, RFC-0001 #safety-edge-headless-emergency-stop). The adapter dials
     every endpoint listed in RegisterAck.edge_endpoints and holds one EdgeStream
     per edge node, with the same dial-out, mTLS, and reconnect-backoff
     discipline as the ControlStream. The stream survives control-plane
@@ -333,10 +338,10 @@ def add_EdgeServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class EdgeService:
+class EdgeService(object):
     """---------------------------------------------------------------------------
     EdgeService — served by the Zone Controller EDGE NODE on the facility LAN,
-    not by the control plane (RA-10-D1, RFC-0001 #fleet-adapter-protocol-the-edge-stream, RFC-0001 #safety-edge-headless-emergency-stop). The adapter dials
+    not by the control plane (RFC-0001 #fleet-adapter-protocol-the-edge-stream, RFC-0001 #safety-edge-headless-emergency-stop). The adapter dials
     every endpoint listed in RegisterAck.edge_endpoints and holds one EdgeStream
     per edge node, with the same dial-out, mTLS, and reconnect-backoff
     discipline as the ControlStream. The stream survives control-plane

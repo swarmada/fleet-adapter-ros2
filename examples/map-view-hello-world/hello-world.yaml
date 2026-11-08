@@ -1,0 +1,107 @@
+# Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# The map-view Hello World in a kind cluster: the map-view service, and a simulated
+# explore-floor source feeding it. run.sh applies this after it creates Secret
+# mapview-ingest (the writers' token). The service has a ClusterIP only: you reach it through
+# `kubectl port-forward`, and nothing outside the cluster can.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mapview-hello
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: map-view
+  namespace: mapview-hello
+  labels: {app.kubernetes.io/name: map-view}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: map-view}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: map-view}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: map-view
+          image: swarmada-mapview:dev
+          imagePullPolicy: Never
+          args: ["fleet_adapter_ros2.mapview.service", "--host", "0.0.0.0", "--port", "8080"]
+          env:
+            - name: SWARMADA_MAPVIEW_TOKEN
+              valueFrom: {secretKeyRef: {name: mapview-ingest, key: token}}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: map-view
+  namespace: mapview-hello
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: map-view}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sim-explorer
+  namespace: mapview-hello
+  labels: {app.kubernetes.io/name: sim-explorer}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: sim-explorer}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: sim-explorer}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: sim-explorer
+          image: swarmada-mapview:dev
+          imagePullPolicy: Never
+          args: ["fleet_adapter_ros2.mapview.hello_world", "--url", "http://map-view:8080"]
+          env:
+            - name: SWARMADA_MAPVIEW_TOKEN
+              valueFrom: {secretKeyRef: {name: mapview-ingest, key: token}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: scratch, mountPath: /tmp}
+      volumes:
+        - name: scratch
+          emptyDir: {sizeLimit: 64Mi}

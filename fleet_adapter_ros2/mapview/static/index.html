@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
+     SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map view</title>
+<link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+<header>
+  <h1>Map view</h1>
+  <label>Robot <select id="robot" aria-label="Robot"></select></label>
+  <span id="link" class="pill">Connecting</span>
+</header>
+<main>
+  <div id="stage"><canvas id="map" aria-label="Map of the robot's session"></canvas></div>
+  <aside id="panel" aria-live="polite">
+    <p id="source" class="lead">No session yet.</p>
+    <p id="sim" class="pill warn" hidden>Simulated</p>
+    <dl>
+      <dt>Phase</dt><dd id="phase">-</dd>
+      <dt>Report</dt><dd id="text">-</dd>
+      <dt>Robot</dt><dd id="pose">No pose yet.</dd>
+      <dt>Map</dt><dd id="mapinfo">No map yet.</dd>
+      <dt>Free area</dt><dd id="area">-</dd>
+      <dt>Frame</dt><dd id="frame">-</dd>
+      <dt>Refused</dt><dd id="refused">0</dd>
+    </dl>
+    <ul class="legend">
+      <li><i class="sw free"></i>Free</li>
+      <li><i class="sw occ"></i>Occupied</li>
+      <li><i class="sw unknown"></i>Unknown</li>
+      <li><i class="sw keep"></i>Keep-out</li>
+      <li><i class="sw path"></i>Path</li>
+      <li><i class="sw target"></i>Target</li>
+    </ul>
+    <p class="note">Read-only. This page sends nothing to any robot.</p>
+  </aside>
+</main>
+<script src="viewer.js"></script>
+</body>
+</html>

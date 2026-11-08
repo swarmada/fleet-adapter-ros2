@@ -1,0 +1,8 @@
+# Everything is left out of the build context but what the Dockerfile copies.
+*
+!fleet_adapter_ros2/__init__.py
+!fleet_adapter_ros2/explore.py
+!fleet_adapter_ros2/explore_steps.py
+!fleet_adapter_ros2/sim_explore.py
+!fleet_adapter_ros2/mapview/
+fleet_adapter_ros2/mapview/__pycache__
