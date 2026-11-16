@@ -1,0 +1,64 @@
+name: humble
+on: [push, pull_request]
+jobs:
+  # The adapter's declared floor is Python >=3.10, protobuf >=3.20.3 and grpcio >=1.64.1, so
+  # that it installs and runs on ROS 2 Humble (Ubuntu 22.04, Python 3.10). This job is what
+  # checks that claim: the floor versions, Humble's own Python, and Humble's real rclpy.
+  humble:
+    runs-on: ubuntu-22.04
+    # ros:humble-ros-base-jammy, the image index as of 2026-11-15 (built 2026-11-12).
+    container: ros:humble-ros-base-jammy@sha256:d9f14e84747bea639a65e00cf871d2c68ae55385d2acf6239614de0cadb41dcc
+    timeout-minutes: 30
+    steps:
+      # First: actions/checkout needs git in the container for its sparse checkouts.
+      - name: Install git, pip and the Nav2 messages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3-pip ros-humble-nav2-msgs
+      - uses: actions/checkout@v4
+      - name: Checkout swarmada SDK (5792bb5, EstopToken)
+        uses: actions/checkout@v4
+        with:
+          repository: swarmada/swarmada
+          ref: 5792bb578f2bd3f80f431a6e959ec8034dea7518
+          path: swarmada-sdk
+          sparse-checkout: |
+            sdk/python
+          sparse-checkout-cone-mode: false
+      - name: Checkout swarmada monorepo (conformance harness + proto)
+        uses: actions/checkout@v4
+        with:
+          repository: swarmada/swarmada
+          ref: rfc-0001-v0.4
+          path: swarmada-src
+          sparse-checkout: |
+            proto
+            adapters/__init__.py
+            adapters/conformance
+            adapters/scenarios
+          sparse-checkout-cone-mode: false
+      - name: Install at the declared floor
+        run: |
+          python3 --version
+          python3 -m pip install -e ./swarmada-sdk/sdk/python
+          python3 -m pip install -e '.[dev]' 'protobuf==3.20.3' 'grpcio==1.64.1'
+          python3 -c "import google.protobuf, grpc; print('protobuf', google.protobuf.__version__, 'grpcio', grpc.__version__)"
+      - name: The vendored stubs load on the floor protobuf
+        run: python3 -c "from fleet_adapter.v1 import fleet_adapter_pb2, fleet_adapter_pb2_grpc; print('stubs ok')"
+      - name: Safety-wiring tests (no ROS sourced)
+        run: python3 -m pytest tests/ -v
+      - name: Nav2Binding on Humble's rclpy
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          python3 -m pytest tests/test_rclpy_odom_counts.py -v
+      - name: Conformance on Python 3.10 (RFC-0001 v0.4, suite 2026.10.22.2)
+        # grpcio-tools, which the harness compiles its stubs with, cannot be installed at
+        # protobuf 3.20.3, so this step runs after it and the protobuf it brings.
+        working-directory: swarmada-src
+        run: |
+          python3 -m pip install grpcio-tools
+          python3 -m adapters.conformance \
+            --stub-path proto \
+            --adapter-name fleet-adapter-ros2 \
+            --adapter-cmd "python3 $GITHUB_WORKSPACE/fleet_adapter_ros2/adapter.py --endpoint localhost:{port} --binding simulated"
