@@ -14,7 +14,7 @@ jobs:
       - name: Install git, pip and the Nav2 messages
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git python3-pip ros-humble-nav2-msgs
+          apt-get install -y --no-install-recommends git python3-pip python3-venv ros-humble-nav2-msgs
       - uses: actions/checkout@v4
       - name: Checkout swarmada SDK (5792bb5, EstopToken)
         uses: actions/checkout@v4
@@ -38,36 +38,48 @@ jobs:
             adapters/scenarios
           sparse-checkout-cone-mode: false
       - name: Install at the declared floor
-        # With Ubuntu 22.04's own pip, as a Humble user has it (not upgraded). It cannot install
-        # the SDK in editable mode, so the SDK and the adapter are installed as packages: that puts
-        # the declared floor and every dependency in place, as pip resolves them. The steps below
-        # import the CHECKOUT, not the installed copy: tests/conftest.py and adapter.py put the
-        # checkout first on sys.path, the stub check runs from the checkout, and conformance runs
-        # the checkout's adapter.py. The last line shows both.
+        # Into a venv over the system site-packages, so Humble's rclpy stays visible, with the pip
+        # Ubuntu 22.04 ships (22.0.2, not upgraded); the gz rig installs the adapter the same way.
+        # Not into the system interpreter: there, that pip built both packages with the system's
+        # old setuptools, which does not read [project], and installed "UNKNOWN 0.0.0". The venv's
+        # bin goes first on PATH, so every later step's python3 is the venv's.
         run: |
           python3 --version
-          python3 -m pip --version
-          python3 -m pip install ./swarmada-sdk/sdk/python
-          python3 -m pip install '.[dev]' 'protobuf==3.20.3' 'grpcio==1.64.1'
-          python3 -c "import google.protobuf, grpc; print('protobuf', google.protobuf.__version__, 'grpcio', grpc.__version__)"
-          python3 -c "import fleet_adapter_ros2; print('checkout:', fleet_adapter_ros2.__file__)"
-          (cd /tmp && python3 -c "import fleet_adapter_ros2, swarmada_sdk; print('installed:', fleet_adapter_ros2.__file__, swarmada_sdk.__file__)")
+          python3 -c "import setuptools; print('system setuptools', setuptools.__version__)"
+          python3 -m venv --system-site-packages /opt/venv
+          /opt/venv/bin/python -m pip --version
+          /opt/venv/bin/python -m pip install ./swarmada-sdk/sdk/python
+          /opt/venv/bin/python -m pip install '.[dev]' 'protobuf==3.20.3' 'grpcio==1.64.1'
+          /opt/venv/bin/python -c "import google.protobuf, grpc; print('protobuf', google.protobuf.__version__, 'grpcio', grpc.__version__)"
+          echo /opt/venv/bin >> "$GITHUB_PATH"
+      - name: The installed copy works, outside the checkout
+        # So that packaging cannot regress: the installed package imports, its vendored stubs
+        # with it, and the console script starts. --help ends before main() imports the stubs,
+        # so they are imported here too.
+        working-directory: /tmp
+        run: |
+          python3 -c "import fleet_adapter_ros2, swarmada_sdk; print('installed:', fleet_adapter_ros2.__file__, swarmada_sdk.__file__)"
+          python3 -c "import fleet_adapter_ros2.adapter; from fleet_adapter.v1 import fleet_adapter_pb2, fleet_adapter_pb2_grpc; print('installed stubs:', fleet_adapter_pb2.__file__)"
+          fleet-adapter-ros2 --help > /dev/null
+          echo "console script: $(command -v fleet-adapter-ros2) --help ok"
       - name: The vendored stubs load on the floor protobuf
         run: python3 -c "from fleet_adapter.v1 import fleet_adapter_pb2, fleet_adapter_pb2_grpc; print('stubs ok')"
       - name: Safety-wiring tests (no ROS sourced)
+        # These import the checkout: tests/conftest.py puts it first on sys.path.
         run: python3 -m pytest tests/ -v
       - name: Nav2Binding on Humble's rclpy
         shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           python3 -m pytest tests/test_rclpy_odom_counts.py -v
-      - name: Conformance on Python 3.10 (RFC-0001 v0.4, suite 2026.10.22.2)
+      - name: Conformance on Python 3.10 (RFC-0001 v0.4, suite 2026.10.22.2), the installed adapter
         # grpcio-tools, which the harness compiles its stubs with, cannot be installed at
-        # protobuf 3.20.3, so this step runs after it and the protobuf it brings.
+        # protobuf 3.20.3, so this step runs after it and the protobuf it brings. The adapter is
+        # the installed console script, not the checkout's adapter.py.
         working-directory: swarmada-src
         run: |
           python3 -m pip install grpcio-tools
           python3 -m adapters.conformance \
             --stub-path proto \
             --adapter-name fleet-adapter-ros2 \
-            --adapter-cmd "python3 $GITHUB_WORKSPACE/fleet_adapter_ros2/adapter.py --endpoint localhost:{port} --binding simulated"
+            --adapter-cmd "fleet-adapter-ros2 --endpoint localhost:{port} --binding simulated"

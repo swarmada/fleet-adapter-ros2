@@ -60,6 +60,39 @@ base is CONFIRMED at rest from odom; and it **streams task completion**, derivin
 reporting the terminal `TaskStatusUpdate` once with the executing fencing token
 echoed (C6.4), so the control-plane FleetTask lifecycle sees the goal finish.
 
+## Install
+
+On ROS 2 Humble (Ubuntu 22.04, Python 3.10), install into a virtual environment created with
+`--system-site-packages`:
+
+```bash
+sudo apt install python3-venv
+source /opt/ros/humble/setup.bash
+python3 -m venv --system-site-packages ~/fleet-adapter-venv
+~/fleet-adapter-venv/bin/python -m pip install <swarmada checkout>/sdk/python
+~/fleet-adapter-venv/bin/python -m pip install <this checkout>
+```
+
+Why a virtual environment, and why with `--system-site-packages`:
+
+* **With `--system-site-packages`**, the environment still sees what apt installed for the
+  system Python: Humble's `rclpy` and the ROS message packages the `ros2` binding imports. A
+  plain virtual environment hides them.
+* **Not the system Python itself.** Outside a virtual environment, Ubuntu 22.04's pip builds
+  these packages with the system's own setuptools, which is too old to read `pyproject.toml`'s
+  `[project]` table, and installs a package called `UNKNOWN 0.0.0` instead. Inside a virtual
+  environment it builds them with the setuptools they declare. Upgrading pip is not needed.
+
+The Swarmada SDK is not on PyPI yet, so it is installed from a swarmada checkout. This adapter
+needs swarmada 5792bb5 or later, which confirms a stop only from a state report received
+after it; with an older SDK the adapter refuses to start and says so.
+
+Then, with ROS 2 sourced:
+
+```bash
+~/fleet-adapter-venv/bin/fleet-adapter-ros2 --binding ros2 --endpoint <control-plane> ...
+```
+
 ## Run
 
 ```bash
