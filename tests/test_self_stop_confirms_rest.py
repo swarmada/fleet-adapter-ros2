@@ -143,6 +143,7 @@ def test_c4_2_a_goal_unanswered_past_2_s_at_lease_expiry_still_gets_a_terminal_r
     a, b, sent = _rig(vx=0.0)                              # odom: at rest
     a._telemetry_interval = HARNESS_TELEMETRY_S
     t0 = _assign(a, C42_LEASE_MS)
+    a._registered_outbox = a._outbox                       # this session's RegisterRobot is queued
     loop = threading.Thread(target=a._telemetry_loop, args=(None,), daemon=True)
     loop.start()
     lease = threading.Thread(target=a._lease_loop, daemon=True)

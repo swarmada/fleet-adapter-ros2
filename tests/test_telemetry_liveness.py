@@ -81,6 +81,7 @@ def _one_cycle(robot) -> list:
             return next(cycles)
 
     a._shutdown = _Once()
+    a._registered_outbox = a._outbox     # this session's RegisterRobot is queued
     a._telemetry_loop(None)
     out = []
     while not a._outbox.empty():
@@ -175,6 +176,7 @@ def test_no_terminal_task_status_is_streamed_while_blind() -> None:
     a._telemetry_interval = 0
     cycles = iter([False, True])
     a._shutdown = NS(is_set=lambda: next(cycles))
+    a._registered_outbox = a._outbox         # this session's RegisterRobot is queued
     a._telemetry_loop(None)
     msgs = [a._outbox.get_nowait() for _ in range(a._outbox.qsize())]
     assert all(m.telemetry is not None for m in msgs), \
