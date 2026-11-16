@@ -388,6 +388,11 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         self._safety_unserved = False
         self._shutdown = threading.Event()
         self._telemetry_started = False
+        # The outbox of the session whose RegisterRobot has been queued. A session's telemetry goes
+        # out only after it: RegisterRobot is the first message for a robot on every connect and
+        # reconnect (C2.1), and when the ControlStream comes up before the SafetyStream the
+        # registration waits on its own thread while the telemetry thread is already running.
+        self._registered_outbox: queue.Queue | None = None
         # Whether the binding could observe the robot on the previous telemetry cycle, so
         # the degrade/recover transitions are logged once each instead of 5x a second.
         self._transport_was_live = True
@@ -642,6 +647,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
         def register() -> None:
             outbox.put(pb.AdapterMessage(register=pb.RegisterRobot(robot_id=self._robot_id)))
+            self._registered_outbox = outbox    # this session's telemetry may follow it now
             self._send_capabilities_snapshot()  # the catalog, and scenario hardware if any
 
         if not self._safety_required or self._safety_up.is_set():
@@ -1578,6 +1584,13 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             # comms-flaky: withhold telemetry during a gap / while the stream is down.
             if self._sim is not None and self._sim.telemetry_suppressed():
                 time.sleep(self._telemetry_interval)
+                continue
+            if self._registered_outbox is not self._outbox:
+                # This session has not queued its RegisterRobot yet (it waits for the SafetyStream,
+                # or the stream is being redialled): no telemetry ahead of it. Looked at again
+                # soon, not at the telemetry cadence, so the first payload follows registration
+                # closely. The binding is still ticked above.
+                time.sleep(_TELEMETRY_INTERVAL)
                 continue
             if not live:
                 self._report_transport_not_live(detail)
