@@ -77,7 +77,12 @@ jobs:
         # These import the checkout: tests/conftest.py puts it first on sys.path.
         run: python3 -m pytest tests/ -v
       - name: Nav2Binding on Humble's rclpy
+        # Sourcing Humble puts its own pytest plugins on the path (launch_testing among them),
+        # written for the older pytest Humble ships; they fail to load in the venv's pytest.
+        # This test uses none of them, so plugin autoload is off for this step.
         shell: bash
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: |
           source /opt/ros/humble/setup.bash
           python3 -m pytest tests/test_rclpy_odom_counts.py -v
