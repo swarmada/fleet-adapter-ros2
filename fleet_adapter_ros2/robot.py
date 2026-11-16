@@ -119,9 +119,9 @@ class RobotBinding(Protocol):
     # ── threads ──────────────────────────────────────────────────────────────
     # The adapter calls a binding from several threads (control, telemetry, safety, edge),
     # and EVERY STOP PATH -- estop, lease self-stop, cancel, reconcile -- calls
-    # `command_stop`, `tick`, `is_stopped` and `stop_settled` WITHOUT the adapter's robot
-    # lock, so that no stop ever waits behind another call into the binding. Those four MUST
-    # be safe to call concurrently with any method here. None of the methods here may block,
+    # `command_stop`, `tick`, `is_stopped`, `state_seq` and `stop_settled` WITHOUT the adapter's
+    # robot lock, so that no stop ever waits behind another call into the binding. Those five
+    # MUST be safe to call concurrently with any method here. None of the methods here may block,
     # `stop_settled` excepted, and only for its `timeout`: a binding that has to wait for
     # something (a server to appear, a reply) does that wait on a thread of its own, holding
     # nothing the stop methods need.
@@ -156,6 +156,38 @@ class RobotBinding(Protocol):
     def is_stopped(self, robot_id: str) -> bool:
         """CONFIRMED at rest — the ground truth the adapter waits on before it
         reports STOPPED. MUST reflect the real robot, never a timeout."""
+
+    def state_seq(self, robot_id: str) -> int:
+        """The count of NEW state reports received from this robot (an int).
+
+        Every stop -- estop, cancel, pause, lease self-stop, the SafetyStream lost, shutdown --
+        is confirmed only from a report counted after the stop was commanded
+        (``swarmada_sdk.safety.await_estop_confirmation``), so a report RECEIVED before the stop
+        cannot confirm a robot that is moving again. What it proves is receipt, not when the
+        robot sent the report: one the robot sent before the stop and that is received after it
+        still counts. The count only ever goes up; only a new report from this robot raises it
+        (not another robot's, not a duplicate or a redelivered message); and it is raised only
+        after the state `is_stopped` reads is stored. 0 for a robot this binding does not drive.
+
+        Known limit: it MUST NOT raise. Where it raises decides what happens:
+
+        * Read once the stop has been commanded (the stop's token), any exception is caught and
+          logged, and the looks read the count themselves when they begin, which is stricter.
+        * Read during the looks, a transport's RuntimeError is turned into a FAILED that says
+          why, as it is for `tick` and `is_stopped`. Any other exception is treated as a bug in
+          the safety path and is not caught, and what it does depends on the thread:
+          - on the control thread (the first look of a cancel or a pause) it ends the control
+            stream, and the adapter shuts down, stopping the robot first;
+          - on the SafetyStream (an estop) it ends that stream's thread while the adapter still
+            treats the stream as up: the estop gets no EstopAck, assignments and resumes go on
+            being accepted, and no later estop on that stream is read (the stop itself was
+            already commanded);
+          - on the EdgeStream (an estop from an edge node) it ends that stream's thread the same
+            way, and on the telemetry thread (the simulated estop drill) it ends telemetry;
+          - on the SafetyStream-lost report's thread, the lost action's FAILED report is never
+            sent;
+          - on the stop reporter (a cancel's or a pause's later looks) and the lease thread
+            (a lease self-stop) it is logged, and that stop gets no answer."""
 
     def rest_evidence_gap(self, robot_id: str) -> str:
         """``""`` when this binding's rest evidence may confirm a stop; otherwise ONE
@@ -216,6 +248,11 @@ class SimulatedRobot:
         # tick() is called from the telemetry loop and, without the adapter's lock, from the
         # estop and self-stop confirmation, so the clock it advances is guarded.
         self._clock_lock = threading.Lock()
+        # Each tick is this model's state report (`state_seq`): it advances the model that
+        # is_stopped reads, so a stop is confirmed from a tick after it, as a real robot's
+        # is from a report after it. Counted for the robots spawned here only.
+        self._ticks = 0
+        self._spawned: set[str] = set()
         self._moving: dict[str, bool] = {}
         self._pos: dict[str, tuple[float, float]] = {}
         # A goal is reached SIM_SPEED_MPS after it is sent, measured from where the robot was:
@@ -261,6 +298,7 @@ class SimulatedRobot:
         return True
 
     def spawn(self, robot_id: str) -> None:
+        self._spawned.add(robot_id)
         self._moving[robot_id] = False
         self._pos[robot_id] = (0.0, 0.0)
 
@@ -330,6 +368,13 @@ class SimulatedRobot:
     def tick(self, dt: float) -> None:
         with self._clock_lock:
             self._elapsed += dt  # advance the scenario clock; still a no-op for real motion
+            self._ticks += 1     # after the model has moved on: this tick's report is stored
+
+    def state_seq(self, robot_id: str) -> int:
+        """The ticks so far, each this model's state report (see `RobotBinding.state_seq`).
+        0 for a robot never spawned here, so no stop of it is confirmed."""
+        with self._clock_lock:
+            return self._ticks if robot_id in self._spawned else 0
 
     def is_stopped(self, robot_id: str) -> bool:
         exploring = self._explore is not None and self._explore.moving()

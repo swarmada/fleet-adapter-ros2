@@ -49,7 +49,7 @@ from test_stop_never_waits import (  # noqa: F401 - ros_msgs is a fixture
     ros_msgs,
 )
 
-from conftest import mark_transport_live
+from conftest import mark_transport_live, odom_after_stop
 from fleet_adapter_ros2.adapter import fleet_adapter_ros2Adapter as Adapter
 from fleet_adapter_ros2.nav2_binding import Nav2Binding
 from fleet_adapter_ros2.robot import SimulatedRobot
@@ -92,6 +92,7 @@ def _rig(source: str | None):
     b._cancel_goal_by_id = lambda _id: None
     b.start = lambda: None
     b.on_odom(_odom(0.0))
+    odom_after_stop(b)    # the echo goes on being published after the stop, as it is
     a = Adapter(pb, None, b, ROBOT)
     cp = _ControlPlane()
     control = threading.Thread(target=a.run_control_stream, args=(cp,), daemon=True)
@@ -335,18 +336,23 @@ def test_the_stop_is_still_commanded_at_once_whatever_can_be_confirmed(rig):
 def test_a_pause_says_it_cannot_be_acknowledged_stopped(rig):
     source, a, b, server, cp = rig
     _driving(a, b, server, cp)
+    sent = time.monotonic()
     cp.send(2, pause=pb.PauseCapabilities(require_stop_before_ack=True))
-    res = _result(a, "pause", 2.0)
+    res = _result(a, "pause", STOP_S + 1.0)
+    took = time.monotonic() - sent
     assert res is not None
     # The robot is cruising either way, so neither declaration acks it paused. What differs
-    # is what the operator is told: "awaiting" promises an answer that is coming, and on this
-    # platform it never is.
+    # is what the operator is told: measured odometry waited the stop budget for rest and says
+    # it did not come; on this platform rest can never be confirmed, and the answer says so at
+    # once.
     assert res.command_result.pause.paused is False
     if source == "command-derived":
         assert "cannot be acknowledged stopped" in res.command_result.pause.message
         assert "command-derived" in res.command_result.pause.message
+        assert took < 0.5, f"answered in {took:.2f} s, not at once"
     else:
-        assert res.command_result.pause.message == "nav2: pausing (awaiting confirmed rest)"
+        assert res.command_result.pause.message.startswith(
+            "nav2: goal cancelled + hold, but rest was not confirmed: ")
 
 
 # ── the setting: required on ros2, no default ────────────────────────────────────────────

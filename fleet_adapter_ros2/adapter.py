@@ -32,9 +32,20 @@ import grpc
 # `pip install -e .` makes this unnecessary).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+import swarmada_sdk.safety as _sdk_safety
+
+# An SDK from before `EstopToken` confirms a stop from whatever state report it last had, which
+# may be older than the stop: a robot at rest a moment before the stop and moving now would be
+# confirmed STOPPED (swarmada 5792bb5). Refuse to start on one rather than confirm stops that way.
+if not hasattr(_sdk_safety, "EstopToken"):
+    raise ImportError("swarmada_sdk.safety has no EstopToken: this adapter needs a swarmada-sdk "
+                      "that confirms a stop only from a state report received after it "
+                      "(swarmada 5792bb5 or later, v0.4.1)")
+
 from swarmada_sdk.safety import (  # noqa: E402
     ESTOP_FAILED,
     ESTOP_STOPPED,
+    EstopToken,
     FenceDecision,
     FenceGuard,
     LeaseMonitor,
@@ -330,6 +341,11 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # server (the binding parks the goal instead), and no stop's confirmation sleeps
         # under it. So nothing a stop needs can be held by something that blocks.
         self._robot_lock = threading.Lock()
+        # Commands that may set the robot moving again: a resume and every accepted assignment
+        # raise it, under `_robot_lock`. A pause waiting for confirmed rest reads it under the
+        # same lock before it says paused=true (`_on_pause`), so a pause the robot has already
+        # been told to leave never claims to hold it.
+        self._motion_epoch = 0
         self._robot_id = robot_id
         self._fence = FenceGuard()                              # C3
         # C4. The lease is looked at by its own thread (`_lease_loop`), never at the telemetry
@@ -389,9 +405,12 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         self._estop_drilled = False       # estop-drill fires once
         self._reconnect_pending = False   # comms-flaky: a stream drop is in progress
         self._active_call = None          # live ControlStream call, for cancel-on-drop
-        # Reports that must wait for a stop to settle (cancel, reconcile) are made from here,
-        # in the order their stops were commanded, never on the control thread: a message read
-        # behind a cancel -- a renewal, a second cancel, an assignment -- is never held up by it.
+        # Reports that must wait for a stop to settle or for rest (cancel, reconcile, pause) are
+        # made from here, in the order their stops were commanded, never on the control thread: a
+        # message read behind a cancel -- a renewal, a second cancel, an assignment -- is never
+        # held up by it. They run one at a time, so a report waits behind the ones before it: a
+        # cancel commanded right behind a pause that never confirms rest starts its own looks
+        # only once that pause's 2.0 s budget has passed, and answers about 4 s after it.
         self._stop_reports: queue.Queue = queue.Queue()
         self._stop_reporter: threading.Thread | None = None
         # explore-floor and Charge. A binding with no exploration stack declares neither (a
@@ -750,21 +769,25 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         self._defer_stop_report(
             lambda: report(self._robot.stop_settled(self._robot_id, _STOP_SETTLE_S)))
 
-    def _when_confirmed(self, report) -> None:
+    def _when_confirmed(self, report, since: EstopToken | None) -> None:
         """Call ``report(confirmed, settled, why_not)`` once rest after the stop just commanded
         is confirmed by the estop's rule (`_confirm_stop`), or once its budget has passed
-        without that. The cancel reports from this, as the estop and the lease self-stop do, so
-        no stop path says the robot stopped before it is observed at rest.
+        without that. The cancel and the pause report from this, as the estop and the lease
+        self-stop do, so no stop path says the robot stopped before it is observed at rest.
+
+        ``since`` is the stop's token (`_stop_token`), read when the stop was commanded. The
+        first look and the looks after it both wait past it, so a report received between the
+        two still counts.
 
         The first look is taken here, on the caller's thread, and never sleeps: rest already
         observed, or a transport that cannot be read, is reported at once. Otherwise the looks
         and the report are handed to the stop reporter thread, so the control thread goes on
         reading while the robot brakes."""
-        confirmed, settled, why = self._confirm_stop(looks=1)
+        confirmed, settled, why = self._confirm_stop(since, looks=1)
         if confirmed or why:
             report(confirmed, settled, why)
             return
-        self._defer_stop_report(lambda: report(*self._confirm_stop()))
+        self._defer_stop_report(lambda: report(*self._confirm_stop(since)))
 
     def _defer_stop_report(self, job) -> None:
         self._stop_reports.put(job)
@@ -774,7 +797,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
     def _report_stops(self) -> None:
         """The stop reporter: one deferred report at a time, in the order the stops were
-        commanded. Each waits at most one stop budget (2.0 s); no lock is held while it waits."""
+        commanded. Each takes at most one stop budget (2.0 s) of its own, after the reports
+        queued before it; no lock is held while it waits."""
         while True:
             job = self._stop_reports.get()
             try:
@@ -797,6 +821,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             return  # answered by _on_cancel, once its stop has settled
         elif which == "pause":
             self._on_pause(command.pause, result)
+            return  # answered by _on_pause, once rest is confirmed or cannot be
         elif which == "resume":
             self._on_resume(command.resume, result)
         elif which == "scan":
@@ -904,6 +929,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         cancelled = self._current_action
         token = self._current_fencing_token
         self._robot.command_stop(self._robot_id)
+        since = self._stop_token()
         self._halted_action = cancelled
 
         def report(confirmed: bool, settled: bool, why: str) -> None:
@@ -934,7 +960,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 disposition=pb.CANCEL_DISPOSITION_STOPPED_SAFELY))
             self._end_on_cancel(cancelled, task_map.TASK_CANCELLED, token, cancel.cause)
             self._outbox.put(pb.AdapterMessage(command_result=result))
-        self._when_confirmed(report)
+        self._when_confirmed(report, since)
 
     def _end_on_cancel(self, action: str, state_name: str, fencing_token: int | None,
                        cause_value, message: str = "") -> None:
@@ -962,8 +988,17 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
     def _on_pause(self, pause, result) -> None:
         """Map Swarmada pause → Nav2 goal cancel-and-hold (the base halts, the target
-        is retained for resume). require_stop_before_ack acks paused=true only once the
-        base is CONFIRMED at rest from odom (is_stopped), never inferred."""
+        is retained for resume), and answer it.
+
+        With ``require_stop_before_ack``, ``paused=true`` is reported only once the base is
+        CONFIRMED at rest (C11.1), by the estop's rule (`_when_confirmed`): from an odom message
+        received after the pause was commanded, never from one received before it. The answer
+        is the pause's one PauseResult, sent when that is known: at once when the first look
+        confirms rest; otherwise from the stop reporter, ``paused=true`` as soon as a fresh
+        message shows rest within the stop budget, or ``paused=false`` saying why once the
+        budget has passed. So a pause that will be acknowledged is, and one that cannot be says
+        so; neither is left at "awaiting". Without ``require_stop_before_ack`` the answer is
+        ``paused=true`` at once, as before: it claims the hold, not rest."""
         pb = self._pb
         job = self._running_job()
         with self._robot_lock:
@@ -971,18 +1006,38 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 job.pause()   # the explorer and the return goal stop; the segment waits
             else:
                 self._robot.command_pause(self._robot_id)
-            stopped = self._robot.is_stopped(self._robot_id)
-        paused = stopped if pause.require_stop_before_ack else True
-        if paused:
-            message = "nav2: goal cancelled + hold"
-        else:
-            gap = self._robot.rest_evidence_gap(self._robot_id)
-            # "awaiting" promises an answer that is coming. On a platform with no channel
-            # that can confirm rest it never is, and saying so is the difference between a
-            # pause that is slow and one that can never be acknowledged.
-            message = (f"nav2: goal cancelled + hold, but the pause cannot be acknowledged "
-                       f"stopped: {gap}") if gap else "nav2: pausing (awaiting confirmed rest)"
-        result.pause.CopyFrom(pb.PauseResult(paused=paused, message=message))
+            since = self._stop_token()
+            epoch = self._motion_epoch
+        held = "nav2: goal cancelled + hold"
+        if not pause.require_stop_before_ack:
+            result.pause.CopyFrom(pb.PauseResult(paused=True, message=held))
+            self._outbox.put(pb.AdapterMessage(command_result=result))
+            return
+
+        def report(confirmed: bool, settled: bool, why: str) -> None:
+            # Under `_robot_lock`, which a resume and an assignment take to move the robot: the
+            # answer either goes out before such a command is acted on, or sees that it was and
+            # does not say paused=true. Rest observed after a resume or a new assignment is not
+            # this pause holding the robot; the robot is about to move.
+            with self._robot_lock:
+                superseded = self._motion_epoch != epoch
+                if confirmed and not superseded:
+                    paused, message = True, held
+                elif superseded:
+                    paused, message = False, (f"{held}, but a later resume or assignment may have "
+                                              f"set the robot moving before rest was confirmed")
+                else:
+                    gap = self._robot.rest_evidence_gap(self._robot_id)
+                    # On a platform with no channel that can confirm rest the pause can never be
+                    # acknowledged, and saying so is the difference between a pause that is slow
+                    # and one that never will be.
+                    paused, message = False, (
+                        f"{held}, but the pause cannot be acknowledged stopped: {gap}" if gap
+                        else f"{held}, but rest was not confirmed: "
+                             f"{self._unconfirmed(settled, why)}")
+                result.pause.CopyFrom(pb.PauseResult(paused=paused, message=message))
+                self._outbox.put(pb.AdapterMessage(command_result=result))
+        self._when_confirmed(report, since)
 
     def _on_resume(self, resume, result) -> None:
         """Map Swarmada resume → re-dispatch the retained NavigateToPose goal."""
@@ -1000,6 +1055,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                                        "assign a new one"))
             return
         with self._robot_lock:
+            self._motion_epoch += 1
             if isinstance(job, explore.ExploreJob):
                 job.resume()  # the segment restarts the phase it was paused in
             else:
@@ -1069,6 +1125,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         with self._lease_lock:
             self._halt_job()  # a segment the new assignment supersedes stops first
             with self._robot_lock:
+                self._motion_epoch += 1
                 self._robot.command_move(self._robot_id, goal.x, goal.y, goal.yaw)
             self._current_action = task.action_id
             self._halted_action = ""
@@ -1174,6 +1231,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         job.fencing_token = token
         with self._lease_lock:
             self._halt_job()
+            with self._robot_lock:
+                self._motion_epoch += 1     # the job moves the robot from here on
             self._job = job
             self._current_action = task.action_id
             self._halted_action = ""
@@ -1283,12 +1342,17 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         hold = getattr(self._robot, "command_hold", None) or self._robot.command_stop
         job = self._job
         segment = self._stack is not None and any(t.is_alive() for t in self._segments)
-        steps = [("holding the base and cancelling the navigation goal", lambda: hold(rid))]
+        since: list[EstopToken | None] = [None]   # the hold's token, read once it has returned
+
+        def hold_and_count() -> None:
+            hold(rid)
+            since[0] = self._stop_token()
+        steps = [("holding the base and cancelling the navigation goal", hold_and_count)]
         if segment:
             steps.append(("stopping the explorer", self._stack.stop_explorer))
         if job is not None:
             steps.append(("ending the running job", job.halted.set))
-        steps.append(("looking for rest", self._report_rest_at_shutdown))
+        steps.append(("looking for rest", lambda: self._report_rest_at_shutdown(since[0])))
         if segment:
             steps.append(("ending the processes the segment launched", self._stack.end_segment))
         print("shutdown: stopping the robot before the adapter exits", file=sys.stderr)
@@ -1299,8 +1363,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 print(f"shutdown: {what} raised {type(exc).__name__}: {exc}; going on with the "
                       f"steps after it", file=sys.stderr)
 
-    def _report_rest_at_shutdown(self) -> None:
-        confirmed, settled, why = self._confirm_stop()
+    def _report_rest_at_shutdown(self, since: EstopToken | None) -> None:
+        confirmed, settled, why = self._confirm_stop(since)
         print("shutdown: " + ("the robot is at rest" if confirmed else
                               "rest was not confirmed: " + self._unconfirmed(settled, why)),
               file=sys.stderr)
@@ -1347,14 +1411,17 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             lapsed = []
             for robot_id in self._lapsed:
                 self._robot.command_stop(robot_id)   # closes a manual-drive's teleop gate too
+                since = self._stop_token()
                 if isinstance(self._job, manual_drive.ManualDriveJob):
                     self._job.halted.set()   # the self-stop below reports its end, not the job
-                lapsed.append((robot_id, self._current_action, self._current_fencing_token))
+                lapsed.append((robot_id, self._current_action, self._current_fencing_token,
+                               since))
             self._lapsed.clear()
-        for robot_id, action, token in lapsed:
-            self._self_stop(robot_id, action, token)
+        for robot_id, action, token, since in lapsed:
+            self._self_stop(robot_id, action, token, since)
 
-    def _self_stop(self, robot_id: str, action: str, token: int | None) -> None:
+    def _self_stop(self, robot_id: str, action: str, token: int | None,
+                   since: EstopToken | None) -> None:
         """C4.2: bring the task to a CONFIRMED stop and report it -- STOPPED only once the
         robot is observed at rest, FAILED when rest cannot be confirmed within the stopping budget.
 
@@ -1370,8 +1437,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         Reported for `action`, the one whose lease lapsed, as a TERMINAL action_status. Without
         one the control plane sees only silence after the lease lapses, which is
         indistinguishable from a robot that merely stopped reporting, so dual execution cannot
-        be ruled out. An action assigned while this confirms is neither reported nor dropped."""
-        confirmed, settled, why = self._confirm_stop()
+        be ruled out. An action assigned while this confirms is neither reported nor dropped.
+
+        ``since`` is the stop's token, read at the lapse once the stop was commanded."""
+        confirmed, settled, why = self._confirm_stop(since)
         if action:
             if confirmed:
                 state, message = task_map.TASK_STOPPED, ""
@@ -1389,14 +1458,38 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             f"the stop was commanded, but rest was not observed within "
             f"{_ESTOP_TICK_S * _ESTOP_TICKS:g} s."))
 
-    def _confirm_stop(self, looks: int | None = None) -> tuple[bool, bool, str]:
+    def _stop_token(self) -> EstopToken | None:
+        """The token a stop's confirmation waits past: the binding's `state_seq` for this
+        robot, read right after the stop was commanded, as the SDK's `command_estop` reads it
+        for an estop. Only a state report counted after it confirms the stop. Read once per
+        stop, by the path that commanded it, and kept for every look at that stop.
+
+        None for a binding without `state_seq`, or when it raised; the looks then read the
+        count when they begin, which is stricter, never looser."""
+        state_seq = getattr(self._robot, "state_seq", None)
+        if not callable(state_seq):
+            return None
+        try:
+            seq = state_seq(self._robot_id)
+        except Exception as exc:  # noqa: BLE001 - a stop path: the stop is already commanded
+            print(f"a stop's state_seq raised once the stop was commanded ({exc!r}); its "
+                  f"confirmation reads the count when it begins", file=sys.stderr)
+            return None
+        return EstopToken(self._robot_id, seq, id(self._robot))
+
+    def _confirm_stop(self, since: EstopToken | None,
+                      looks: int | None = None) -> tuple[bool, bool, str]:
         """Confirm rest after a commanded stop: ``(confirmed, settled, why_not)``.
 
         Up to `looks` looks, _ESTOP_TICK_S apart -- by default the estop's confirmed-stop budget --
-        each asking `is_stopped`, the estop's own test. Returns at once when it holds. Otherwise
-        `settled` says whether a goal sent before the stop is what kept it from holding. A
-        transport that cannot be read is not at rest, and `why_not` says so (C5.3: never rest
-        from silence). No adapter lock is held, so nothing waits behind this."""
+        by the estop's own rule, the SDK's `await_estop_confirmation`: `is_stopped`, from a
+        state report counted after ``since``. ``since`` is the stop's token (`_stop_token`),
+        read once the stop was commanded, so a report from before the stop never confirms it;
+        None reads the count when the looks begin, which is stricter. Returns at once when rest
+        is confirmed. Otherwise `settled` says whether a goal sent before the stop is what kept
+        it from holding. A transport that cannot be read is not at rest, and `why_not` says so
+        (C5.3: never rest from silence). No adapter lock is held, so nothing waits behind this.
+        A single look never sleeps: the cancel takes it on the control thread."""
         rid = self._robot_id
         looks = _ESTOP_TICKS if looks is None else looks
         # The binding's evidence is judged BEFORE the robot is looked at. On a platform whose
@@ -1408,12 +1501,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         if gap:
             return False, self._robot.stop_settled(rid, 0), gap
         try:
-            for look in range(looks):
-                self._robot.tick(_ESTOP_TICK_S)
-                if self._robot.is_stopped(rid):
-                    return True, True, ""
-                if look < looks - 1:
-                    time.sleep(_ESTOP_TICK_S)
+            sleep = time.sleep if looks > 1 else (lambda _s: None)
+            if await_estop_confirmation(self._robot, rid, _ESTOP_TICK_S, looks, sleep,
+                                        since=since) == ESTOP_STOPPED:
+                return True, True, ""
             return False, self._robot.stop_settled(rid, 0), ""
         except RuntimeError as exc:
             print(f"a stop could not be confirmed - the robot binding's transport is not "
@@ -1684,7 +1775,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         RuntimeError is absorbed. A bug in the safety primitive itself must still crash.
         """
         try:
-            command_estop(self._robot, self._robot_id)
+            # The token: the binding's state_seq read once the stop was commanded. Both waits
+            # below wait past it, so only a report received after the stop confirms it, and one
+            # received while the STOPPING receipt goes out still counts.
+            since = command_estop(self._robot, self._robot_id)
             if self._robot.rest_evidence_gap(self._robot_id):
                 # The stop IS commanded (above, first, always). What cannot follow is a
                 # confirmation: this platform's rest evidence is the command echoed back, so
@@ -1697,7 +1791,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             # confirm_estop's first look, unchanged. Rest confirmed now is a single STOPPED,
             # which C5.2 allows only when rest is confirmed within the 500 ms of C5.5.
             if await_estop_confirmation(self._robot, self._robot_id, _ESTOP_TICK_S, 1,
-                                        sleep=lambda _s: None) == ESTOP_STOPPED:
+                                        sleep=lambda _s: None, since=since) == ESTOP_STOPPED:
                 return ESTOP_STOPPED
             # Otherwise the first ack is the receipt, sent now that the stop is commanded:
             # STOPPING, "received and braking; rest not yet confirmed". A goal sent before the
@@ -1706,7 +1800,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             if on_receipt is not None:
                 on_receipt()
             return await_estop_confirmation(self._robot, self._robot_id, _ESTOP_TICK_S,
-                                            _ESTOP_TICKS - 1)
+                                            _ESTOP_TICKS - 1, since=since)
         except RuntimeError as exc:
             print(f"estop could not be confirmed - the robot binding's transport is not "
                   f"live, so rest cannot be read from the robot and C5.3 forbids inferring "
@@ -1915,6 +2009,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         rid = self._robot_id
         with self._lease_lock:
             self._robot.command_stop(rid)
+            since = self._stop_token()
             self._halt_job()
             action, token = self._current_action, self._current_fencing_token
             if action and action != self._halted_action:
@@ -1929,7 +2024,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         self._current_fencing_token = None
 
         def report() -> None:
-            confirmed, settled, why_not = self._confirm_stop()
+            confirmed, settled, why_not = self._confirm_stop(since)
             message = (f"stopped: the SafetyStream was lost ({why}) and no estop could reach the "
                        f"robot" + ("" if confirmed else
                                    f"; {self._unconfirmed(settled, why_not)}"))

@@ -29,7 +29,7 @@ from types import SimpleNamespace as NS
 import pytest
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 
-from conftest import mark_transport_live
+from conftest import mark_transport_live, odom_after_stop
 from safety_call import SafetyCall
 from fleet_adapter_ros2.adapter import fleet_adapter_ros2Adapter as Adapter
 from fleet_adapter_ros2.nav2_binding import Nav2Binding
@@ -189,6 +189,7 @@ def rig(ros_msgs):
     b._cmd_vel, b._twist_type = _Publisher(), _Twist
     b.start = lambda: None               # bring-up: the stand-ins above are the transport
     b.on_odom(_odom(0.0))                # odom says rest
+    odom_after_stop(b)                   # and keeps publishing after a stop
     a = Adapter(pb, None, b, ROBOT)
     cp = _ControlPlane()
     control = threading.Thread(target=a.run_control_stream, args=(cp,), daemon=True)

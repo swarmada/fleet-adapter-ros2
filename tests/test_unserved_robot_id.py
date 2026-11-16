@@ -152,7 +152,9 @@ def _estop(monkeypatch, robot_id: str) -> tuple[list, list]:
     real = adapter_mod.command_estop
     monkeypatch.setattr(adapter_mod, "command_estop",
                         lambda robot, rid: (stopped.append(rid), real(robot, rid))[1])
-    a = Adapter(pb, None, SimulatedRobot(), ROBOT)
+    robot = SimulatedRobot()
+    robot.spawn(ROBOT)                 # as bring-up does: an unspawned robot's stop never confirms
+    a = Adapter(pb, None, robot, ROBOT)
     cp = _OneEstop(a, robot_id)
     t = threading.Thread(target=a.run_safety_stream, args=(cp,), daemon=True)
     t.start()

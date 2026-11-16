@@ -30,7 +30,7 @@ from types import SimpleNamespace as NS
 import pytest
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 
-from conftest import mark_transport_live
+from conftest import mark_transport_live, odom_after_stop
 from test_stop_never_waits import _SafetyStub
 from fleet_adapter_ros2 import adapter as adapter_mod
 from fleet_adapter_ros2.adapter import fleet_adapter_ros2Adapter as Adapter
@@ -100,6 +100,7 @@ def _rig():
     b._server_ready = lambda: True                        # the server is up: goals go at once
     b._cmd_vel, b._twist_type = _Publisher(), _Twist
     b.on_odom(_odom(0.0))                       # the robot has not moved yet: odom says rest
+    odom_after_stop(b)                          # and odom keeps publishing after a stop
     return Adapter(pb, None, b, ROBOT), b, sent
 
 

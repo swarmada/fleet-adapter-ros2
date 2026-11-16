@@ -190,10 +190,10 @@ def test_an_inert_transport_still_answers_an_estop_with_FAILED() -> None:
 def test_a_live_transport_still_reaches_the_real_confirm_estop() -> None:
     """The wrapper must not swallow the normal path: a binding that CAN confirm rest must
     still report STOPPED, or the guard above would have turned every estop into FAILED."""
-    from conftest import mark_transport_live
+    from conftest import mark_transport_live, odom_after_stop
     from fleet_adapter_ros2.nav2_binding import Nav2Binding
 
-    b = mark_transport_live(Nav2Binding("amr-1", odometry_source="measured"))
+    b = odom_after_stop(mark_transport_live(Nav2Binding("amr-1", odometry_source="measured")))
     b.on_odom(NS(pose=NS(pose=NS(position=NS(x=0.0, y=0.0, z=0.0),
                                  orientation=NS(x=0.0, y=0.0, z=0.0, w=1.0))),
                  twist=NS(twist=NS(linear=NS(x=0.0, y=0.0, z=0.0),
