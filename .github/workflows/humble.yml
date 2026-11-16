@@ -38,11 +38,20 @@ jobs:
             adapters/scenarios
           sparse-checkout-cone-mode: false
       - name: Install at the declared floor
+        # With Ubuntu 22.04's own pip, as a Humble user has it (not upgraded). It cannot install
+        # the SDK in editable mode, so the SDK and the adapter are installed as packages: that puts
+        # the declared floor and every dependency in place, as pip resolves them. The steps below
+        # import the CHECKOUT, not the installed copy: tests/conftest.py and adapter.py put the
+        # checkout first on sys.path, the stub check runs from the checkout, and conformance runs
+        # the checkout's adapter.py. The last line shows both.
         run: |
           python3 --version
-          python3 -m pip install -e ./swarmada-sdk/sdk/python
-          python3 -m pip install -e '.[dev]' 'protobuf==3.20.3' 'grpcio==1.64.1'
+          python3 -m pip --version
+          python3 -m pip install ./swarmada-sdk/sdk/python
+          python3 -m pip install '.[dev]' 'protobuf==3.20.3' 'grpcio==1.64.1'
           python3 -c "import google.protobuf, grpc; print('protobuf', google.protobuf.__version__, 'grpcio', grpc.__version__)"
+          python3 -c "import fleet_adapter_ros2; print('checkout:', fleet_adapter_ros2.__file__)"
+          (cd /tmp && python3 -c "import fleet_adapter_ros2, swarmada_sdk; print('installed:', fleet_adapter_ros2.__file__, swarmada_sdk.__file__)")
       - name: The vendored stubs load on the floor protobuf
         run: python3 -c "from fleet_adapter.v1 import fleet_adapter_pb2, fleet_adapter_pb2_grpc; print('stubs ok')"
       - name: Safety-wiring tests (no ROS sourced)
