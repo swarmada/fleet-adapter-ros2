@@ -133,8 +133,10 @@ def test_the_protocol_declares_the_lifecycle() -> None:
     """The seam itself. Without this the adapter's call site is an assumption about
     bindings rather than a requirement on them, which is the state that shipped inert.
     """
-    assert "start" in RobotBinding.__protocol_attrs__
-    assert "stop" in RobotBinding.__protocol_attrs__
+    # The Protocol's own members: vars(), since typing's __protocol_attrs__ exists only from
+    # Python 3.12 and this runs on Humble's 3.10.
+    assert "start" in vars(RobotBinding)
+    assert "stop" in vars(RobotBinding)
 
 
 # ── the detection half: an inert binding must not be able to hide ─────────────
