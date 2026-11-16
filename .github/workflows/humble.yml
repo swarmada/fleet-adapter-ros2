@@ -38,19 +38,27 @@ jobs:
             adapters/scenarios
           sparse-checkout-cone-mode: false
       - name: Install at the declared floor
-        # Into a venv over the system site-packages, so Humble's rclpy stays visible, with the pip
-        # Ubuntu 22.04 ships (22.0.2, not upgraded); the gz rig installs the adapter the same way.
-        # Not into the system interpreter: there, that pip built both packages with the system's
-        # old setuptools, which does not read [project], and installed "UNKNOWN 0.0.0". The venv's
-        # bin goes first on PATH, so every later step's python3 is the venv's.
+        # Into a venv over the system site-packages, so Humble's rclpy stays visible; the gz rig
+        # installs the adapter the same way. The venv's bin goes first on PATH, so every later
+        # step's python3 is the venv's.
+        #
+        # pip is upgraded inside the venv only (the system's pip is untouched): Ubuntu 22.04's pip
+        # 22.0.2 does not isolate a build from the system's dist-packages, in a
+        # --system-site-packages venv or on the bare system, so it built both packages with the
+        # system's setuptools 59.6, which does not read [project], and installed "UNKNOWN 0.0.0"
+        # (runs 43926902302, 43932130288). Fixed upstream in pip 22.3 (pypa/pip#6264) and
+        # 23.0-23.0.1 (#11598, #11623, #11740); Ubuntu's report is LP: #2018288, whose fix
+        # shipped in pip 23.1, hence the minimum. A package built as UNKNOWN fails the step.
         run: |
           python3 --version
           python3 -c "import setuptools; print('system setuptools', setuptools.__version__)"
           python3 -m venv --system-site-packages /opt/venv
+          /opt/venv/bin/python -m pip install --upgrade 'pip>=23.1'
           /opt/venv/bin/python -m pip --version
           /opt/venv/bin/python -m pip install ./swarmada-sdk/sdk/python
           /opt/venv/bin/python -m pip install '.[dev]' 'protobuf==3.20.3' 'grpcio==1.64.1'
           /opt/venv/bin/python -c "import google.protobuf, grpc; print('protobuf', google.protobuf.__version__, 'grpcio', grpc.__version__)"
+          /opt/venv/bin/python -c "import sys, importlib.metadata as m; bad = sorted(d.metadata['Name'] for d in m.distributions() if (d.metadata['Name'] or '').upper() == 'UNKNOWN'); print('installed: swarmada-sdk', m.version('swarmada-sdk'), 'fleet-adapter-ros2', m.version('fleet-adapter-ros2')); sys.exit('FAILED: a package was built as UNKNOWN 0.0.0, with the wrong setuptools' if bad else 0)"
           echo /opt/venv/bin >> "$GITHUB_PATH"
       - name: The installed copy works, outside the checkout
         # So that packaging cannot regress: the installed package imports, its vendored stubs
@@ -58,6 +66,7 @@ jobs:
         # so they are imported here too.
         working-directory: /tmp
         run: |
+          echo "python3 is $(command -v python3)"
           python3 -c "import fleet_adapter_ros2, swarmada_sdk; print('installed:', fleet_adapter_ros2.__file__, swarmada_sdk.__file__)"
           python3 -c "import fleet_adapter_ros2.adapter; from fleet_adapter.v1 import fleet_adapter_pb2, fleet_adapter_pb2_grpc; print('installed stubs:', fleet_adapter_pb2.__file__)"
           fleet-adapter-ros2 --help > /dev/null

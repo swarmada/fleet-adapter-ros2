@@ -69,19 +69,26 @@ On ROS 2 Humble (Ubuntu 22.04, Python 3.10), install into a virtual environment 
 sudo apt install python3-venv
 source /opt/ros/humble/setup.bash
 python3 -m venv --system-site-packages ~/fleet-adapter-venv
+~/fleet-adapter-venv/bin/python -m pip install --upgrade 'pip>=23.1'
 ~/fleet-adapter-venv/bin/python -m pip install <swarmada checkout>/sdk/python
 ~/fleet-adapter-venv/bin/python -m pip install <this checkout>
 ```
 
-Why a virtual environment, and why with `--system-site-packages`:
+Why:
 
-* **With `--system-site-packages`**, the environment still sees what apt installed for the
-  system Python: Humble's `rclpy` and the ROS message packages the `ros2` binding imports. A
-  plain virtual environment hides them.
-* **Not the system Python itself.** Outside a virtual environment, Ubuntu 22.04's pip builds
-  these packages with the system's own setuptools, which is too old to read `pyproject.toml`'s
-  `[project]` table, and installs a package called `UNKNOWN 0.0.0` instead. Inside a virtual
-  environment it builds them with the setuptools they declare. Upgrading pip is not needed.
+* **A virtual environment with `--system-site-packages`** keeps the adapter's packages apart
+  from the system's, while still seeing what apt installed for the system Python: Humble's
+  `rclpy` and the ROS message packages the `ros2` binding imports. A plain virtual environment
+  hides them.
+* **pip 23.1 or later, in that environment only.** Ubuntu 22.04's pip (22.0.2) does not keep a
+  package's build apart from the system's packages, on the bare system or in a
+  `--system-site-packages` environment. It builds these packages with the system's setuptools
+  (59.6), which is too old to read `pyproject.toml`'s `[project]` table, and installs a package
+  called `UNKNOWN 0.0.0`. pip fixed this upstream
+  ([pypa/pip#6264](https://github.com/pypa/pip/issues/6264), and
+  [#11740](https://github.com/pypa/pip/pull/11740) for Debian's installation layout); Ubuntu's
+  report is [LP: #2018288](https://bugs.launchpad.net/ubuntu/+source/python-pip/+bug/2018288).
+  The upgrade stays inside the virtual environment; the system's pip is not changed.
 
 The Swarmada SDK is not on PyPI yet, so it is installed from a swarmada checkout. This adapter
 needs swarmada 5792bb5 or later, which confirms a stop only from a state report received
