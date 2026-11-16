@@ -7,12 +7,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"          # swarmada-sdk requires >=3.12
+          python-version: "3.12"
       # swarmada-sdk isn't on PyPI yet and the conformance harness lives in the
       # swarmada monorepo — sparse-checkout both from there. This adapter's proto
       # stubs are vendored here (fleet_adapter/), so it needs no monorepo access
-      # at runtime; the checkout is only for the SDK + harness.
-      - name: Checkout swarmada monorepo (SDK + conformance harness + proto)
+      # at runtime; the checkouts are only for the SDK and the harness.
+      #
+      # Two checkouts, at two refs. The adapter needs an SDK that confirms a stop only from
+      # a state report received after it (EstopToken, 5792bb5), which v0.4 predates; the
+      # harness stays at the release it is qualified against. The SDK's only change since
+      # rfc-0001-v0.4 is 5792bb5. It removes nothing, but it changes what existing callers
+      # get: await_estop_confirmation now confirms only from a report counted after the stop
+      # when the binding has state_seq, and warns once for a binding without one. Both
+      # checkouts move to v0.4.1 once it is tagged.
+      - name: Checkout swarmada SDK (5792bb5, EstopToken)
+        uses: actions/checkout@v4
+        with:
+          repository: swarmada/swarmada
+          ref: 5792bb578f2bd3f80f431a6e959ec8034dea7518
+          path: swarmada-sdk
+          sparse-checkout: |
+            sdk/python
+          sparse-checkout-cone-mode: false
+      - name: Checkout swarmada monorepo (conformance harness + proto)
         uses: actions/checkout@v4
         with:
           repository: swarmada/swarmada
@@ -21,7 +38,6 @@ jobs:
           ref: rfc-0001-v0.4
           path: swarmada-src
           sparse-checkout: |
-            sdk/python
             proto
             adapters/__init__.py
             adapters/conformance
@@ -29,7 +45,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Install
         run: |
-          pip install -e ./swarmada-src/sdk/python
+          pip install -e ./swarmada-sdk/sdk/python
           pip install -e '.[dev]' grpcio-tools
       - name: Safety-wiring tests
         run: pytest tests/ -v

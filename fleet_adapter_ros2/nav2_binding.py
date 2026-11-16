@@ -480,6 +480,22 @@ class Nav2Binding:
         with self._lock:
             return self._odom_count, self._odom_stamp
 
+    def state_seq(self, robot_id: str) -> int:
+        """How many odom messages have been received from this robot: the SDK's
+        ``state_seq`` (``swarmada_sdk.safety.await_estop_confirmation``). A stop is confirmed
+        only once this has gone past its value read right after the stop was commanded, so an
+        odom message received before the stop cannot confirm a robot that is moving again.
+
+        Only :meth:`on_odom` raises it, and it stores the reading :meth:`is_stopped` judges
+        under the same lock, so a raised count never pairs with an older reading. Scan,
+        battery, TF, feedback and teleop messages do not raise it. The odom subscription is
+        reliable and volatile, so no message is delivered twice. 0 for a robot id this binding
+        does not drive, so nothing confirms a stop of it."""
+        if robot_id != self._robot_id:
+            return 0
+        with self._lock:
+            return self._odom_count
+
     # ── transport liveness ────────────────────────────────────────────────────
     # The executor thread is the only thing feeding every accessor above. When it
     # dies they all keep answering — with the last value each cached before it did.

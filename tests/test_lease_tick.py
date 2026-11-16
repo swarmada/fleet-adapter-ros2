@@ -192,7 +192,9 @@ def test_a_renewal_does_not_wait_behind_a_self_stop_in_progress(moving):
 
 
 def test_the_lease_thread_survives_concurrent_renewals_and_a_failing_self_stop(monkeypatch):
-    a = Adapter(pb, None, SimulatedRobot(), ROBOT)
+    robot = SimulatedRobot()
+    robot.spawn(ROBOT)                 # as bring-up does: an unspawned robot's stop never confirms
+    a = Adapter(pb, None, robot, ROBOT)
     real = a._self_stop
     calls = []
 

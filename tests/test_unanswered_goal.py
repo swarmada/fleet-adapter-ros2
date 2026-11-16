@@ -42,7 +42,7 @@ from test_stop_never_waits import (  # noqa: F401 - ros_msgs is a fixture
     ros_msgs,
 )
 
-from conftest import mark_transport_live
+from conftest import mark_transport_live, odom_after_stop
 from fleet_adapter_ros2.adapter import fleet_adapter_ros2Adapter as Adapter
 from fleet_adapter_ros2.nav2_binding import Nav2Binding
 
@@ -77,6 +77,7 @@ def rig(ros_msgs):  # noqa: F811 - the imported fixture
     b._cancel_goal_by_id = b.cancelled_ids.append
     b.start = lambda: None
     b.on_odom(_odom(0.0))                                  # odom says rest
+    odom_after_stop(b)                                     # and keeps publishing after a stop
     a = Adapter(pb, None, b, ROBOT)
     cp = _ControlPlane()
     control = threading.Thread(target=a.run_control_stream, args=(cp,), daemon=True)

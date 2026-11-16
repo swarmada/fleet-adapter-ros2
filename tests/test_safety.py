@@ -16,7 +16,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from conftest import mark_transport_live
+from conftest import mark_transport_live, odom_after_stop
 from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED, confirm_estop
 
 from fleet_adapter_ros2.nav2_binding import Nav2Binding
@@ -67,8 +67,9 @@ def test_command_stop_cancels_goal_and_holds() -> None:
 # passed before only because the binding could not tell it had never been started.
 
 def test_confirm_estop_returns_stopped_when_odom_confirms_rest() -> None:
-    # confirm_estop → command_stop, then polls is_stopped; odom shows rest → STOPPED.
-    b = mark_transport_live(Nav2Binding(robot_id="amr-1"))
+    # confirm_estop → command_stop, then polls is_stopped; odom after the stop shows rest →
+    # STOPPED. Odom from before the stop alone is not enough (state_seq).
+    b = odom_after_stop(mark_transport_live(Nav2Binding(robot_id="amr-1")))
     b.on_odom(_odom(vx=0.0, wz=0.0))
     assert confirm_estop(b, "amr-1") == ESTOP_STOPPED
 
