@@ -133,7 +133,13 @@ class RobotBinding(Protocol):
 
     def command_stop(self, robot_id: str) -> None:
         """Command a safe stop. NOT a confirmation — that is `is_stopped`. Called from any
-        thread, without the adapter's lock, and MUST NOT block."""
+        thread, without the adapter's robot lock (some callers hold its lease lock), and MUST
+        NOT block.
+
+        If it raises when the SafetyStream is lost, the adapter tries it again, every 50 ms
+        for the 2 s stop budget and then every second, until it goes out, new work takes the
+        robot, or the adapter shuts down, and refuses new work meanwhile. The lost action's
+        report says whether it went out within the budget; a later success is logged."""
 
     def stop_settled(self, robot_id: str, timeout: float) -> bool:
         """After a stop: wait up to ``timeout`` s until nothing the stop was meant to end can
@@ -175,17 +181,15 @@ class RobotBinding(Protocol):
           logged, and the looks read the count themselves when they begin, which is stricter.
         * Read during the looks, a transport's RuntimeError is turned into a FAILED that says
           why, as it is for `tick` and `is_stopped`. Any other exception is treated as a bug in
-          the safety path and is not caught, and what it does depends on the thread:
+          the safety path: it is logged at error level with its trace and counted
+          (SAFETY_PATH_FAULT), and what else happens depends on the thread:
+          - an estop on the SafetyStream is answered FAILED, and the stream is treated as lost:
+            motion refused and the robot held, then the stream redialled after a backed-off wait;
+          - an estop on the EdgeStream, or the simulated estop drill, is answered FAILED, and
+            that thread goes on;
+          - the SafetyStream-lost report still reports the lost action FAILED;
           - on the control thread (the first look of a cancel or a pause) it ends the control
             stream, and the adapter shuts down, stopping the robot first;
-          - on the SafetyStream (an estop) it ends that stream's thread while the adapter still
-            treats the stream as up: the estop gets no EstopAck, assignments and resumes go on
-            being accepted, and no later estop on that stream is read (the stop itself was
-            already commanded);
-          - on the EdgeStream (an estop from an edge node) it ends that stream's thread the same
-            way, and on the telemetry thread (the simulated estop drill) it ends telemetry;
-          - on the SafetyStream-lost report's thread, the lost action's FAILED report is never
-            sent;
           - on the stop reporter (a cancel's or a pause's later looks) and the lease thread
             (a lease self-stop) it is logged, and that stop gets no answer."""
 

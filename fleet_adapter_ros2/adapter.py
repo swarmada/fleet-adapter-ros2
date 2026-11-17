@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Iterator
 
 import grpc
@@ -89,6 +90,52 @@ _STOP_SETTLE_S = 2.0
 # The wait before a stream that failed is dialled again: the control stream and the SafetyStream
 # alike, so neither comes back long before the other.
 _REDIAL_S = 0.5
+# After a SafetyStream ends on a fault on the safety path (not an ordinary disconnect, which keeps
+# _REDIAL_S), the wait before redialling starts at _REDIAL_S and doubles with each fault in a row,
+# up to _SAFETY_FAULT_WAIT_MAX_S, so a binding that fails every estop does not flap the stream. A
+# stream that stays up for _SAFETY_FAULT_RESET_S resets it. The robot is held and motion refused
+# for the whole of every wait: the stream is down (_safety_down).
+_SAFETY_FAULT_WAIT_MAX_S = 5.0
+_SAFETY_FAULT_RESET_S = 30.0
+# How long a SafetyStream that faulted waits for what is already queued on it (the estop's FAILED)
+# to reach gRPC before the call is cancelled: gRPC drops a message it pulls after a cancel.
+_SAFETY_FLUSH_S = 1.0
+# When the SafetyStream is lost and the robot's stop raises, it is tried again every _ESTOP_TICK_S
+# within the stop budget, then every _SAFETY_STOP_RETRY_S until it goes out, new work takes the
+# robot, or the adapter shuts down (`_safety_down`).
+_SAFETY_STOP_RETRY_S = 1.0
+
+
+def _fault_text(exc: BaseException) -> str:
+    """The one-line account of a fault on the safety path that goes into an answer."""
+    return (f"the adapter's safety path raised {type(exc).__name__}: {exc} (a fault in the robot "
+            f"binding or the adapter, not the robot's state)")
+
+
+# How a stop retry that did not see its own stop go out ended (`_log_retry`, `_report_lost`).
+_RETRY_ENDINGS = {
+    "taken": ("new work took the robot, so assignments and resumes are accepted again, though no "
+              "stop has gone out since the loss"),
+    "handed over": ("the SafetyStream was lost again, that loss's stop is failing too, and its "
+                    "retry took over"),
+    "stopped later": "the SafetyStream was lost again, and that loss's stop went out",
+    "shutdown": "the adapter is shutting down, and its shutdown commands the stop itself",
+}
+
+
+def _n(count: int, noun: str) -> str:
+    """'1 attempt', '3 attempts'."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+class _SafetyPathFault(Exception):
+    """An estop's confirmation raised something other than the transport's RuntimeError (which
+    is already a FAILED that says why): a bug, in the binding or here. The estop has been
+    answered FAILED (`_estop`); the thread that received the estop logs and counts it
+    (`_log_estop_fault`) and decides what else follows. The SafetyStream treats it as the stream
+    lost. `where` names the estop; the original exception is the cause."""
+
+    where = "estop"
 # A SafetyStream counts as up once the control plane's response headers have come on it: it sends
 # them when it serves the stream (registered for estops, under a verified identity), and a call
 # returns before the server has accepted anything, so nothing earlier proves an estop can reach the
@@ -341,6 +388,20 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # server (the binding parks the goal instead), and no stop's confirmation sleeps
         # under it. So nothing a stop needs can be held by something that blocks.
         self._robot_lock = threading.Lock()
+        # Faults on the safety path (`_safety_fault`): exceptions other than the transport's
+        # RuntimeError that reached a safety thread's boundary. Counted and logged at error level
+        # each time, so a binding that fails on every estop shows as a rising count, not as a
+        # SafetyStream that quietly drops and comes back.
+        self._safety_faults = 0
+        self._safety_faults_lock = threading.Lock()
+        # The next fault-caused SafetyStream redial wait; None: start from _REDIAL_S.
+        self._safety_fault_wait: float | None = None
+        # A stop that raised when the SafetyStream was lost, while it is being tried again: why,
+        # or "". Assignments and resumes are refused while it is set (`_no_estop_path`). The
+        # generation names the one retry that owns it: a later loss takes over. Both written
+        # under `_lease_lock`.
+        self._stop_failing = ""
+        self._stop_retry_gen = 0
         # Commands that may set the robot moving again: a resume and every accepted assignment
         # raise it, under `_robot_lock`. A pause waiting for confirmed rest reads it under the
         # same lock before it says paused=true (`_on_pause`), so a pause the robot has already
@@ -665,10 +726,16 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         threading.Thread(target=wait, daemon=True, name="register-when-safe").start()
 
     def _no_estop_path(self) -> str:
-        """Why the robot may not move now, or "": it may not while its SafetyStream is down."""
+        """Why no motion may be dispatched now, or "": none while the SafetyStream is down, and
+        none while a stop that raised when it was lost is still being tried again."""
         if self._safety_required and not self._safety_up.is_set():
             return ("the SafetyStream is down: no estop can reach this robot, so it does not "
                     "move until the stream is back")
+        failing = self._stop_failing
+        if failing:
+            return (f"the robot's stop is failing (the last attempt: {failing}): it is being "
+                    f"commanded again, and no assignment or resume is accepted until a stop goes "
+                    f"out")
         return ""
 
     def _provisioning_iteration(self, outbox) -> None:
@@ -1767,10 +1834,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         or has died —
         which is correct, and on this path alone it would make things worse if it escaped:
 
-        * `run_safety_stream` and `_edge_loop` call this from inside their response loops,
-          so an escaping exception kills that thread and the control plane gets **no
-          EstopAck at all**. Silence on an estop is strictly less actionable than
-          `FAILED`, which at least says "rest was not confirmed — escalate".
+        * `run_safety_stream` and `_edge_loop` call this from inside their response loops, and
+          a transport fault is not a bug: it is answered here, FAILED with its diagnosis.
+          Silence on an estop is strictly less actionable than `FAILED`, which at least says
+          "rest was not confirmed — escalate".
         * the safety stream is started BEFORE `bring_up_robot()` runs (see `main`), so
           there is a real window in which an estop can arrive at an un-started binding.
           Losing the safety thread permanently to a startup race would be a worse defect
@@ -1785,7 +1852,9 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         C5.2 / C8.3 / C14.1 were misattributed for weeks.
 
         Deliberately NOT a blanket `except Exception`: only the transport's own
-        RuntimeError is absorbed. A bug in the safety primitive itself must still crash.
+        RuntimeError is absorbed here. A bug in the safety primitive itself escapes this
+        function; `_estop`, at the thread's boundary, answers the estop FAILED, logs the bug
+        with its trace and counts it, and raises it on as a fault (`_SafetyPathFault`).
         """
         try:
             # The token: the binding's state_seq read once the stop was commanded. Both waits
@@ -1831,9 +1900,13 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # hardware, so it attests WHEN the stop was issued. C5.3 requires it:
         # reporting STOPPED with nothing attesting a hardware stop is exactly the
         # "inferred, not confirmed" case the estop protocol forbids.
-        self._estop(f"drill-{self._robot_id}", lambda ack: self._safety_outbox.put(
-            pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack)),
-            message="estop drill (scenario)")  # C5 discipline: never faked
+        try:
+            self._estop(f"drill-{self._robot_id}", lambda ack: self._safety_outbox.put(
+                pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack)),
+                message="estop drill (scenario)")  # C5 discipline: never faked
+        except _SafetyPathFault as fault:
+            # Answered FAILED; logged and counted here. Telemetry, which runs the drill, goes on.
+            self._log_estop_fault(fault)
         self._current_action = ""  # safe-hold: drop the task, like a real estop
 
     def _estop(self, estop_id: str, send, message: str = "") -> None:
@@ -1860,8 +1933,41 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                              **({"message": text} if text else {})))
         # No adapter lock: the stop, and every look at the robot after it, go straight to the
         # binding, so an estop never waits behind a dispatch or any other call (C5.1, C5.5).
-        state = self._confirm_estop(on_receipt=lambda: ack(pb.ESTOP_STATE_STOPPING))
-        ack(pb.ESTOP_STATE_STOPPED if state == ESTOP_STOPPED else pb.ESTOP_STATE_FAILED)
+        try:
+            state = self._confirm_estop(on_receipt=lambda: ack(pb.ESTOP_STATE_STOPPING))
+            ack(pb.ESTOP_STATE_STOPPED if state == ESTOP_STOPPED else pb.ESTOP_STATE_FAILED)
+        except Exception as exc:  # a thread boundary: the estop is still answered
+            # Not swallowed: logged with its trace, counted, and raised on as a fault. But the
+            # estop is answered first, before anything is logged -- FAILED, never silence (C5.2,
+            # C5.6), after its STOPPING if that went out -- without asking the binding anything
+            # more, and without stop_initiated_at: whether the stop went out cannot be known when
+            # the call that sends it may be the one that raised.
+            what = _fault_text(exc)
+            send(pb.EstopAck(estop_id=estop_id, state=pb.ESTOP_STATE_FAILED,
+                             message=f"the stop could not be confirmed: {what}"))
+            # Logged and counted by the thread that received the estop, once it has done what
+            # comes first there (the SafetyStream refuses motion first): writing the trace can
+            # block on a slow stderr.
+            fault = _SafetyPathFault(what)
+            fault.where = f"estop {estop_id}"
+            raise fault from exc
+
+    def _log_estop_fault(self, fault: _SafetyPathFault) -> None:
+        """Log and count an estop's fault, from the thread that received the estop."""
+        self._safety_fault(fault.where, fault.__cause__ or fault)
+
+    def _safety_fault(self, where: str, exc: BaseException) -> str:
+        """Count and log, at error level with its trace, an exception that reached a safety
+        thread's boundary. Returns the one-line account that goes into an answer. Called after
+        the answer it owes has been sent: writing the trace can block on a slow stderr."""
+        with self._safety_faults_lock:
+            self._safety_faults += 1
+            count = self._safety_faults
+        what = _fault_text(exc)
+        print(f"SAFETY_PATH_FAULT count={count} where={where}: {what}", file=sys.stderr,
+              flush=True)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        return what
 
     def _maybe_stream_drop(self) -> None:
         """comms-flaky: at the drop time, cancel the ControlStream RPC so it tears
@@ -1897,8 +2003,9 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                          name="safety-stream").start()
 
     def run_safety_stream(self, stub) -> None:
-        """The SafetyStream, dialled again after every drop with the control stream's wait, for
-        as long as the adapter runs. Each stream has its own outbox, so the request generator of
+        """The SafetyStream, dialled again after every drop -- after _REDIAL_S, or after a fault on
+        the safety path a backed-off wait (`_safety_redial_wait`) -- for as long as the adapter
+        runs. Each stream has its own outbox, so the request generator of
         a stream that has ended cannot swallow an ack meant for the next. When it ends while the
         adapter runs, the robot is stopped (`_safety_down`); when the adapter is the one closing
         it, to exit, it ends quietly."""
@@ -1910,15 +2017,24 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 self._safety_gen += 1
                 gen = self._safety_gen
 
-            def requests(outbox=outbox) -> Iterator:
-                while True:
-                    msg = outbox.get()
-                    if msg is None:
-                        return
-                    yield msg
+            drained = threading.Event()
+
+            def requests(outbox=outbox, drained=drained) -> Iterator:
+                # gRPC asks for the next message only once the one before it has been sent, so
+                # `drained` set here means everything queued before the None has gone out.
+                try:
+                    while True:
+                        msg = outbox.get()
+                        if msg is None:
+                            return
+                        yield msg
+                finally:
+                    drained.set()
 
             why = "the control plane ended it"
             opened = time.monotonic()
+            call = None
+            faulted = False
             try:
                 call = stub.SafetyStream(requests())
                 served = self._safety_headers(call)
@@ -1944,11 +2060,55 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             except grpc.RpcError as exc:
                 code = exc.code()
                 why = getattr(code, "name", str(code))
+            except Exception as exc:  # noqa: BLE001 - this thread must outlive any fault in it
+                # A stream whose estop could not be answered from the robot is not trusted: it is
+                # treated as lost. In this order: motion refused and the robot held, at once
+                # (_safety_down); then what is queued -- the estop's FAILED -- is let out, since
+                # gRPC drops a message it pulls after a cancel; then the call is cancelled. The
+                # redial waits back off (_safety_redial_wait). The fault is logged and counted once
+                # motion is refused, since writing its trace can block on a slow stderr.
+                why = f"a fault on the safety path ({exc})"
+                faulted = True
+                self._safety_down_guarded(why, time.monotonic() - opened)
+                if isinstance(exc, _SafetyPathFault):
+                    self._log_estop_fault(exc)
+                else:
+                    self._safety_fault("SafetyStream", exc)
+                if call:
+                    outbox.put(None)
+                    drained.wait(_SAFETY_FLUSH_S)
+                with contextlib.suppress(Exception):
+                    call.cancel()
             outbox.put(None)
             if self._shutdown.is_set():
                 return  # the adapter closed the channel itself, to exit
-            self._safety_down(why, time.monotonic() - opened)
-            time.sleep(_REDIAL_S)
+            open_for = time.monotonic() - opened
+            self._safety_down_guarded(why, open_for)   # already done after a fault: a no-op then
+            time.sleep(self._safety_redial_wait(faulted, open_for))
+
+    def _safety_down_guarded(self, why: str, open_for: float) -> None:
+        """`_safety_down`, from the SafetyStream's own thread, which must outlive a fault in it.
+        `_safety_down` refuses motion first and runs its other steps each on its own, so what is
+        caught here is logged and counted, and the robot stays refused motion."""
+        try:
+            self._safety_down(why, open_for)
+        except Exception as exc:  # noqa: BLE001 - this thread must outlive any fault in it
+            self._safety_fault("SafetyStream lost", exc)
+
+    def _safety_redial_wait(self, faulted: bool, open_for: float) -> float:
+        """How long to wait before dialling the SafetyStream again. An ordinary end: _REDIAL_S.
+        A fault: _REDIAL_S, doubling with each fault in a row up to _SAFETY_FAULT_WAIT_MAX_S,
+        and back to _REDIAL_S once a stream has stayed up for _SAFETY_FAULT_RESET_S."""
+        if open_for >= _SAFETY_FAULT_RESET_S:
+            self._safety_fault_wait = None
+        if not faulted:
+            return _REDIAL_S
+        wait = _REDIAL_S if self._safety_fault_wait is None else self._safety_fault_wait
+        self._safety_fault_wait = min(wait * 2, _SAFETY_FAULT_WAIT_MAX_S)
+        print(f"SAFETY_STREAM_BACKOFF wait={wait:g}s faults={self._safety_faults}: redialling the "
+              f"SafetyStream after a fault on the safety path; the robot stays held and motion "
+              f"refused until it is back", file=sys.stderr, flush=True)
+        return wait
 
     def _estop_unserved(self, cp, outbox) -> None:
         """An estop for a robot this adapter does not serve. It cannot confirm that robot is at
@@ -2008,7 +2168,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         estop can reach the robot any more, so it stops now: the base held and its goal
         cancelled, a running segment ended, and the action it was running ended FAILED with the
         reason. Every assignment and resume is declined until the stream is back
-        (`_no_estop_path`). Said once per loss, not once per redial."""
+        (`_no_estop_path`), and while a stop that raised is still being tried again
+        (`_stop_and_report_lost`). Said once per loss, not once per redial."""
         with self._safety_lock:
             was_up = self._safety_up.is_set()
             self._safety_up.clear()
@@ -2020,30 +2181,161 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                   f"refusing motion until the stream is back; redialling", file=sys.stderr)
         self._safety_flapping = brief
         rid = self._robot_id
+        faults: list = []   # logged once the lease lock is released: nothing waits under it
         with self._lease_lock:
-            self._robot.command_stop(rid)
-            since = self._stop_token()
-            self._halt_job()
+            # Each step on its own, as at shutdown: a stop that raises must not keep the running
+            # job from being ended (a manual-drive's teleop gate closed) or the action from being
+            # ended. Motion is already refused (_safety_up is clear).
+            stop_exc: BaseException | None = None
+            try:
+                self._robot.command_stop(rid)
+            except Exception as exc:  # noqa: BLE001 - the steps after it still run
+                stop_exc = exc
+                faults.append(("SafetyStream lost: the stop", exc))
+            since = self._stop_token() if stop_exc is None else None
+            try:
+                self._halt_job()
+            except Exception as exc:  # noqa: BLE001 - the steps after it still run
+                faults.append(("SafetyStream lost: ending the job", exc))
             action, token = self._current_action, self._current_fencing_token
+            kept = ""   # a cancel in progress keeps its action current: not new work
             if action and action != self._halted_action:
                 self._lease.release(rid)
                 self._current_action = ""
             else:
+                kept = action
                 action = ""   # nothing running, or a cancel in progress that reports its own end
-        if not action:
-            return
-        self._last_task_state = task_map.TASK_FAILED
-        self._last_progress = -1
-        self._current_fencing_token = None
+            # This loss's stop owns the retry from now: one that is still running for an earlier
+            # loss stops at its next attempt.
+            self._stop_retry_gen += 1
+            gen = self._stop_retry_gen
+            self._stop_failing = "" if stop_exc is None else _fault_text(stop_exc)
+        if action:
+            self._last_task_state = task_map.TASK_FAILED
+            self._last_progress = -1
+            self._current_fencing_token = None
+        if action or stop_exc is not None:
+            threading.Thread(target=self._stop_and_report_lost, daemon=True,
+                             name="safety-lost-report",
+                             args=(why, action, token, since, stop_exc, gen, kept)).start()
+        for where, exc in faults:   # after the thread is started: a slow stderr delays nothing
+            self._safety_fault(where, exc)
 
-        def report() -> None:
-            confirmed, settled, why_not = self._confirm_stop(since)
-            message = (f"stopped: the SafetyStream was lost ({why}) and no estop could reach the "
-                       f"robot" + ("" if confirmed else
-                                   f"; {self._unconfirmed(settled, why_not)}"))
-            self._emit_action_status(action, task_map.TASK_FAILED, token, message=message,
-                                     end_cause="ACTION_END_CAUSE_EXECUTION_FAILURE")
-        threading.Thread(target=report, daemon=True, name="safety-lost-report").start()
+    def _try_stop_again(self, gen: int, kept: str) -> tuple[str, BaseException | None]:
+        """One more attempt at a stop that raised when the SafetyStream was lost: "stopped";
+        "raised" (with the exception); "handed over" when a later loss owns the retry and its
+        stop is failing too, "stopped later" when that loss's stop went out; or
+        "taken" when new work has the robot since, which this stop must not touch -- `kept`,
+        the action a cancel in progress kept current, is not new work. Checked and sent together
+        under `_lease_lock`, which an assignment holds while it dispatches, so a stop can never
+        land on the work that replaced it."""
+        with self._lease_lock:
+            if gen != self._stop_retry_gen:
+                # A later loss owns the retry; its own stop went out unless it is failing too.
+                return ("handed over" if self._stop_failing else "stopped later"), None
+            if self._current_action and self._current_action != kept:
+                # The retry gives way, and so does the refusal, though no stop went out: logged
+                # (`_log_retry`). Reachable only by work dispatched just before the loss.
+                self._stop_failing = ""
+                return "taken", None
+            try:
+                self._robot.command_stop(self._robot_id)
+            except Exception as exc:  # noqa: BLE001 - tried again by the caller
+                self._stop_failing = _fault_text(exc)
+                return "raised", exc
+            self._stop_failing = ""
+            return "stopped", None
+
+    def _log_quietly(self, where: str, exc: BaseException) -> None:
+        """`_safety_fault`, on a thread that must go on whatever the log does."""
+        with contextlib.suppress(Exception):
+            self._safety_fault(where, exc)
+
+    def _stop_and_report_lost(self, why: str, action: str, token, since, stop_exc, gen: int,
+                              kept: str) -> None:
+        """The SafetyStream-lost action's end, from its own thread. A stop that raised is tried
+        again here -- every _ESTOP_TICK_S within the stop budget, then every _SAFETY_STOP_RETRY_S --
+        until it goes out, new work takes the robot, a later loss takes the retry over, or the
+        adapter shuts down; until then assignments and resumes are refused (`_no_estop_path`).
+        The action is reported once, when the stop has gone out or the budget has ended, saying
+        what is true then; a stop that goes out later is logged (SAFETY_PATH_RECOVERED), not
+        reported again."""
+        budget = _ESTOP_TICK_S * _ESTOP_TICKS
+        outcome, attempts, last_exc, after = "stopped", 1, stop_exc, since
+        if stop_exc is not None:
+            outcome, end = "raised", time.monotonic() + budget
+            while outcome == "raised" and time.monotonic() < end:
+                if self._shutdown.wait(_ESTOP_TICK_S):
+                    outcome = "shutdown"
+                    break
+                outcome, exc = self._try_stop_again(gen, kept)
+                if outcome in ("stopped", "raised"):
+                    attempts += 1
+                if exc is not None:
+                    last_exc = exc
+            if outcome == "stopped":
+                after = self._stop_token()
+            self._log_retry(why, outcome, attempts, last_exc)
+        if action:
+            try:
+                self._report_lost(why, action, token, outcome, attempts, stop_exc, last_exc,
+                                  after, budget)
+            except Exception as exc:  # noqa: BLE001 - the retry below goes on regardless
+                self._log_quietly("SafetyStream-lost report", exc)
+        late = 0
+        while outcome == "raised":
+            if self._shutdown.wait(_SAFETY_STOP_RETRY_S):
+                self._log_retry(why, "shutdown", attempts + late, last_exc)
+                return
+            outcome, exc = self._try_stop_again(gen, kept)
+            if outcome in ("stopped", "raised"):
+                late += 1
+            if outcome == "raised" and late & (late - 1) == 0:   # logged at 1, 2, 4, 8, ...
+                self._log_quietly(f"SafetyStream lost: the stop, still tried "
+                                  f"({_n(attempts + late, 'attempt')})", exc)
+            elif outcome != "raised":
+                self._log_retry(why, outcome, attempts + late, last_exc)
+
+    def _log_retry(self, why: str, outcome: str, attempts: int, last_exc) -> None:
+        """One line for how a stop that raised at a SafetyStream loss ended up, if it did."""
+        with contextlib.suppress(Exception):
+            if outcome == "raised":
+                self._safety_fault(f"SafetyStream lost: the stop, tried again "
+                                   f"({_n(attempts, 'attempt')})", last_exc)
+            elif outcome == "stopped" and attempts > 1:
+                print(f"SAFETY_PATH_RECOVERED: the stop went out after "
+                      f"{_n(attempts, 'attempt')}, once the SafetyStream was lost ({why})",
+                      file=sys.stderr, flush=True)
+            elif outcome in _RETRY_ENDINGS:
+                print(f"SAFETY_STOP_RETRY_ENDED: after {_n(attempts, 'attempt')} the stop is no "
+                      f"longer tried here: {_RETRY_ENDINGS[outcome]}", file=sys.stderr,
+                      flush=True)
+
+    def _report_lost(self, why, action, token, outcome, attempts, stop_exc, last_exc, after,
+                     budget) -> None:
+        lost = f"the SafetyStream was lost ({why}) and no estop could reach the robot"
+        first = "" if stop_exc is None else f" (the first: {_fault_text(stop_exc)})"
+        raised = f"{_n(attempts, 'attempt')} raised"
+        if outcome == "raised":
+            message = (f"{lost}, and the robot could not be stopped within {budget:g} s: "
+                       f"{raised}, the last {_fault_text(last_exc)}; the adapter keeps "
+                       f"commanding the stop every {_SAFETY_STOP_RETRY_S:g} s, and accepts no "
+                       f"assignment or resume, until a stop goes out")
+        elif outcome in _RETRY_ENDINGS:
+            message = (f"{lost}; this loss's stop raised ({raised}{first}), then "
+                       f"{_RETRY_ENDINGS[outcome]}")
+        else:
+            try:
+                confirmed, settled, why_not = self._confirm_stop(after)
+            except Exception as exc:  # noqa: BLE001 - the action's end is reported regardless
+                confirmed, settled = False, False
+                why_not = self._safety_fault("SafetyStream-lost report", exc)
+            lead = ("stopped" if stop_exc is None else
+                    f"stopped after {_n(attempts, 'attempt')}{first}")
+            message = f"{lead}: {lost}" + ("" if confirmed else
+                                            f"; {self._unconfirmed(settled, why_not)}")
+        self._emit_action_status(action, task_map.TASK_FAILED, token, message=message,
+                                 end_cause="ACTION_END_CAUSE_EXECUTION_FAILURE")
 
     # ── EdgeStream (C8) ──────────────────────────────────────────────────────
 
@@ -2069,8 +2361,14 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
         for ec in estub.EdgeStream(requests()):
             if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
-                self._estop(ec.estop.estop_id,
-                            lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
+                try:
+                    self._estop(ec.estop.estop_id,
+                                lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
+                except _SafetyPathFault as fault:
+                    # Answered FAILED; logged and counted here. The EdgeStream does not gate
+                    # motion (the SafetyStream does, C1.1), so it goes on reading the next estop.
+                    self._log_estop_fault(fault)
+                    continue
 
 
 # The provisioning loop's interval when the control plane states no DiscoveredRobot TTL.
