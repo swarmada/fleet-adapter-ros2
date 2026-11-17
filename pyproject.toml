@@ -32,10 +32,14 @@ desktop = ["matplotlib>=3.5"]
 fleet-adapter-ros2 = "fleet_adapter_ros2.adapter:main"
 
 [tool.setuptools.packages.find]
-include = ["fleet_adapter_ros2*"]
+# The vendored fleet_adapter.v1 stubs ship with the adapter: main() imports them, and an installed
+# adapter has no checkout to find them in. (fleet_adapter has no __init__.py: a namespace package.)
+include = ["fleet_adapter_ros2*", "fleet_adapter", "fleet_adapter.*"]
 
 [tool.setuptools.package-data]
 "fleet_adapter_ros2.mapview" = ["CONTRACT.md", "README.md", "static/*"]
+# The bundled scenarios: main() loads one (healthy-fleet by default) before it dials.
+"fleet_adapter_ros2.scenarios" = ["presets/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

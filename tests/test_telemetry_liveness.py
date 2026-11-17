@@ -211,7 +211,9 @@ def test_the_protocol_declares_the_liveness_question() -> None:
     """Asked of every binding through the contract, not discovered with `hasattr` — a
     binding spelling it `is_connected()` would otherwise be treated as always-observable,
     which is the inert-binding failure shape exactly."""
-    assert "transport_alive" in RobotBinding.__protocol_attrs__
+    # The Protocol's own members: vars(), since typing's __protocol_attrs__ exists only from
+    # Python 3.12 and this runs on Humble's 3.10.
+    assert "transport_alive" in vars(RobotBinding)
 
 
 def test_a_binding_without_the_liveness_method_fails_loudly() -> None:
