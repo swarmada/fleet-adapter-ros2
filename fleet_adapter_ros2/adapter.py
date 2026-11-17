@@ -1127,13 +1127,38 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 resumed=False, message="a manual-drive is not resumed: the pause ended it; "
                                        "assign a new one"))
             return
-        with self._robot_lock:
-            self._motion_epoch += 1
-            if isinstance(job, explore.ExploreJob):
-                job.resume()  # the segment restarts the phase it was paused in
-            else:
-                self._robot.command_resume(self._robot_id)
+        # Under the lease lock, checked again first, for the reason `_refused_under_lease_lock`
+        # gives. Nothing here waits (command_resume never does; a segment's resume sets a flag).
+        with self._lease_lock:
+            refused = self._no_estop_path()
+            if refused:
+                result.resume.CopyFrom(pb.ResumeResult(resumed=False, message=refused))
+                return
+            with self._robot_lock:
+                self._motion_epoch += 1
+                if isinstance(job, explore.ExploreJob):
+                    job.resume()  # the segment restarts the phase it was paused in
+                else:
+                    self._robot.command_resume(self._robot_id)
         result.resume.CopyFrom(pb.ResumeResult(resumed=True, message="nav2: goal re-dispatched"))
+
+    def _refused_under_lease_lock(self, result) -> bool:
+        """Decline an assignment, from inside `_lease_lock` just before it dispatches, if there
+        is no estop path now; say whether it was declined.
+
+        The first check (`_no_estop_path`, before the refusal checks) is not enough on its own:
+        a SafetyStream loss marks the stream down before it takes `_lease_lock` to stop the
+        robot and end the action (`_safety_down`), so an assignment that passed the first check
+        just before the loss could dispatch just after that stop, and move the robot with no
+        estop path and nothing to report it. Checked again here, under the lock the loss stops
+        under, either the dispatch comes first (and the loss stops it and reports its end) or
+        the loss does (and this sees it). `_stop_failing` is written under the same lock."""
+        refused = self._no_estop_path()
+        if refused:
+            result.assign_action.CopyFrom(self._pb.AssignActionResult(
+                accepted=False, rejection=self._pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
+                message=refused))
+        return bool(refused)
 
     def _on_assign(self, task, result) -> None:
         pb = self._pb
@@ -1196,6 +1221,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # first and this goal is dispatched after them. Never a stop meant for the lapsed action
         # landing on this one. Nothing here waits (command_move never does).
         with self._lease_lock:
+            if self._refused_under_lease_lock(result):
+                return
             self._halt_job()  # a segment the new assignment supersedes stops first
             with self._robot_lock:
                 self._motion_epoch += 1
@@ -1276,7 +1303,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         doc = json.loads(task.payload_json or b"{}")
         common = {"action_id": task.action_id, "doc": doc, "stack": self._stack,
                   "limits": self._limits, "clock": self._job_clock}
-        feed = None
+        feed, circle = None, ""
         manual = manual_drive.is_manual_drive(task.action_type, doc)
         handing = handover.is_navigate_handover(task.action_type, doc)
         if handing:
@@ -1285,13 +1312,13 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 robot=self._robot, robot_id=self._robot_id, clock=self._job_clock,
                 emit=lambda *a, **k: self._job_emit(job, *a, **k), rest_s=self._handover_rest_s,
                 ready_s=self._handover_ready_s)
-            feed = self._circle_feed(job, task.action_id, handover.OPERATION)
+            circle = handover.OPERATION
         elif manual:
             job = manual_drive.ManualDriveJob(
                 action_id=task.action_id, params=manual_drive.parse_payload(doc),
                 robot=self._robot, robot_id=self._robot_id, clock=self._job_clock,
                 emit=lambda *a, **k: self._job_emit(job, *a, **k))
-            feed = self._circle_feed(job, task.action_id, manual_drive.OPERATION)
+            circle = manual_drive.OPERATION
         elif task.action_type == "Custom":
             report = lambda *a, **k: self._job_emit(job, *a, **k)
             if self._mapview is not None:
@@ -1303,6 +1330,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             job = explore.ChargeJob(emit=lambda *a, **k: self._job_emit(job, *a, **k), **common)
         job.fencing_token = token
         with self._lease_lock:
+            if self._refused_under_lease_lock(result):
+                return   # the job is never started
             self._halt_job()
             with self._robot_lock:
                 self._motion_epoch += 1     # the job moves the robot from here on
@@ -1325,6 +1354,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 goal = task_map.goal_from_assign("", task.payload_json)
                 with self._robot_lock:
                     self._robot.command_move(self._robot_id, goal.x, goal.y, goal.yaw)
+        if circle:
+            # Built once the job is accepted, before it runs: building it writes the circle to
+            # the map view, which a refused assignment must not leave behind.
+            feed = self._circle_feed(job, task.action_id, circle)
         result.assign_action.CopyFrom(pb.AssignActionResult(
             accepted=True, accepted_fencing_token=task.fencing_token))  # C3.5
         self._last_task_state = task_map.TASK_RUNNING
@@ -2235,7 +2268,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 return ("handed over" if self._stop_failing else "stopped later"), None
             if self._current_action and self._current_action != kept:
                 # The retry gives way, and so does the refusal, though no stop went out: logged
-                # (`_log_retry`). Reachable only by work dispatched just before the loss.
+                # (`_log_retry`). A guard: every dispatch checks again under `_lease_lock`
+                # (`_refused_under_lease_lock`), so no work can take the robot while this runs.
                 self._stop_failing = ""
                 return "taken", None
             try:
