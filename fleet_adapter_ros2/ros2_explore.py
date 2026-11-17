@@ -267,6 +267,11 @@ class Ros2ExploreStack:
                                  + r"/[a-z0-9][-a-z0-9._]*$")
         self._halted: threading.Event | None = None
         self._never = threading.Event()
+        # The explorer's start and stop, one at a time: a start checks the job's mark under
+        # this lock and a stop publishes under it, so the explorer's resume topic always ends
+        # on the later of the two. Held only around a check and a publish (or a detached
+        # launch), never across a wait.
+        self._explorer_lock = threading.Lock()
         self._slam_launched = self._keepout_launched = False
         self._reset_at: float | None = None
         self._mask_at: float | None = None
@@ -310,9 +315,11 @@ class Ros2ExploreStack:
     # fails is reported on stderr, and the steps after it still run.
 
     def halt(self) -> None:
-        self.stop_explorer()      # the binding's own stop cancels its goal; this is the explorer
+        # The mark first: a start of the explorer or a return goal that checks it after this
+        # is refused, and one that checked it before is stopped by what follows.
         if self._halted is not None:
             self._halted.set()
+        self.stop_explorer()      # the binding's own stop cancels its goal; this is the explorer
 
     def hold(self) -> None:
         self.stop_explorer()
@@ -512,25 +519,44 @@ class Ros2ExploreStack:
         got = self.ros.latest("/map")
         return _grid(got[0]) if got is not None else None
 
-    def start_explorer(self) -> bool | None:
+    def start_explorer(self, may_move=None) -> bool | None:
+        """Start the explorer, or resume the one running. With ``may_move`` (the job's), False
+        and nothing started when it is false: the binding's hold is released only if it holds
+        then (`release_hold_for_explorer`), and the resume is published only if it still holds
+        under `_explorer_lock`, the lock every stop of the explorer publishes under."""
+        may = may_move or (lambda: True)
         n = self._count("lib/explore_lite/explore")
         if n is None:
             return None
-        if n >= 1:
-            self.ros.publish("explore/resume", "std_msgs/msg/Bool", {"data": True})
-            return True
+        if not self.binding.release_hold_for_explorer(self.robot_id, may):
+            return False
+        with self._explorer_lock:
+            if not may():
+                return False
+            if n >= 1:
+                self.ros.publish("explore/resume", "std_msgs/msg/Bool", {"data": True})
+                return True
+        # A launch is not made under the lock (a stop must never wait on a shell). A stop
+        # between the check above and the launch, or during the settle, is published before
+        # the new node subscribes and is lost: so the mark is looked at again after the
+        # settle, and the stop sent again. The binding's hold cancels any goal sent meanwhile.
         r = self.shell.run(self._sourced(
             f"exec ros2 run explore_lite explore --ros-args --params-file "
             f"{self._paths['explore_params']} > {self._paths['out']}/explore.log 2>&1",
             overlay=True), detach=True)
-        if r is None or self._wait(EXPLORER_SETTLE_S):
+        if r is None:
             return None
+        halted = self._wait(EXPLORER_SETTLE_S)
+        if halted or not may():
+            self.stop_explorer()
+            return None if halted else False
         return True if self._count("lib/explore_lite/explore") == 1 else None
 
     def stop_explorer(self) -> None:
         # Once: the explorer's stop cancels every navigation goal, the return goal among them.
         try:
-            self.ros.publish("explore/resume", "std_msgs/msg/Bool", {"data": False})
+            with self._explorer_lock:
+                self.ros.publish("explore/resume", "std_msgs/msg/Bool", {"data": False})
         except Exception as exc:  # noqa: BLE001 - a stop path: report, never raise
             print(f"explore-floor: telling the explorer to stop raised {type(exc).__name__}: "
                   f"{exc}", file=sys.stderr)
@@ -588,8 +614,15 @@ class Ros2ExploreStack:
         print(f"explore-floor: exhausted, keeping it out of this segment and of later resumed "
               f"segments: {name}", file=sys.stderr)
 
-    def go_to_mark(self, x: float, y: float, yaw_deg: float) -> None:
-        self.binding.command_move(self.robot_id, x, y, math.radians(yaw_deg))
+    def go_to_mark(self, x: float, y: float, yaw_deg: float, may_move=None) -> bool:
+        """The return goal. With ``may_move`` (the job's), checked under the binding's lock,
+        the lock every stop takes (`Nav2Binding.command_move_if`): False and nothing sent when
+        it is false."""
+        if may_move is None:
+            self.binding.command_move(self.robot_id, x, y, math.radians(yaw_deg))
+            return True
+        return self.binding.command_move_if(self.robot_id, x, y, math.radians(yaw_deg),
+                                            may_move)
 
     def mark_result(self) -> str | None:
         state = self.binding.task_state(self.robot_id)

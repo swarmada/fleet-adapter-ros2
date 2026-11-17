@@ -824,8 +824,9 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
     # Said by every stop path whose stop has not settled: the report must not claim a stop.
     _UNSETTLED = ("the stop was commanded, but a goal sent to the navigation server before it "
-                  "has not been answered: if accepted it is cancelled on arrival, and until "
-                  "then the robot is not known to be stopped.")
+                  "has not been answered, or the server still runs a goal: a goal accepted "
+                  "after the stop is cancelled when its answer arrives, one still running is "
+                  "cancelled by its id, and until then the robot is not known to be stopped.")
 
     def _when_settled(self, report) -> None:
         """Call ``report(settled)`` once the stop just commanded has settled -- the binding
@@ -1335,6 +1336,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             self._halt_job()
             with self._robot_lock:
                 self._motion_epoch += 1     # the job moves the robot from here on
+            if isinstance(job, explore._Job):
+                job.arm()   # before it is current: a stop from now on marks this job
             self._job = job
             self._current_action = task.action_id
             self._halted_action = ""
@@ -1437,9 +1440,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         comes here: the control stream closing, an exception out of its loop, SIGTERM, SIGINT.
 
         In this order, each step on its own, so one that raises is reported and the steps after
-        it still run: the base held and the navigation goal cancelled (the binding's hold, with
-        its zero Twist); the explorer told to stop, if a segment runs; the running job ended, so
-        it commands and reports nothing more; rest looked for, within the estop's budget; and
+        it still run: the running job ended, so it commands and reports nothing more (first, so
+        a segment's motion sent after the hold is refused); the base held and the navigation
+        goal cancelled (the binding's hold, with its zero Twist); the explorer told to stop, if
+        a segment runs; rest looked for, within the estop's budget; and
         the processes a running segment launched ended (SLAM, the keep-out servers, the
         explorer). The caller tears rclpy down after this: every step here needs it. Nothing
         here waits on a lock another thread may hold."""
@@ -1453,11 +1457,14 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         def hold_and_count() -> None:
             hold(rid)
             since[0] = self._stop_token()
-        steps = [("holding the base and cancelling the navigation goal", hold_and_count)]
+        steps = []
+        if job is not None:
+            # First: a segment's return goal or explorer start checks this under the lock the
+            # hold takes, so one sent after the hold is refused, not driven.
+            steps.append(("ending the running job", job.halted.set))
+        steps.append(("holding the base and cancelling the navigation goal", hold_and_count))
         if segment:
             steps.append(("stopping the explorer", self._stack.stop_explorer))
-        if job is not None:
-            steps.append(("ending the running job", job.halted.set))
         steps.append(("looking for rest", lambda: self._report_rest_at_shutdown(since[0])))
         if segment:
             steps.append(("ending the processes the segment launched", self._stack.end_segment))
