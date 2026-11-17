@@ -322,10 +322,12 @@ class SimulatedExploreStack:
 
     def halt(self) -> None:
         self.log.append("halt")
-        with self._lock:
-            self._stop_motion()
+        # The mark first, as the ROS 2 stack sets it: a start or a return that checks it
+        # under `_lock` after this is refused; one before it is stopped here.
         if self._halted is not None:
             self._halted.set()
+        with self._lock:
+            self._stop_motion()
 
     def hold(self) -> None:
         self.log.append("hold")
@@ -428,11 +430,21 @@ class SimulatedExploreStack:
         self._advance()
         return self._answer("read_map", self._grid(None))
 
-    def start_explorer(self) -> bool | None:
+    def start_explorer(self, may_move=None) -> bool | None:
+        """With ``may_move`` (the job's), checked under `_lock`, the lock `halt` and `hold`
+        stop under: False, logged as refused, and nothing started when it is false."""
+        may = may_move or (lambda: True)
+        with self._lock:
+            if not may():
+                self.log.append("start_explorer refused")
+                return False
         answer = self._answer("start_explorer", True)
         if answer:
             self._advance()
             with self._lock:
+                if not may():               # stopped or paused since: nothing starts
+                    self.log.append("start_explorer refused")
+                    return False
                 if self._explore_t < self.explore_seconds:
                     self._exploring, self._explore_since = True, self.clock.now()
                     self._home = False
@@ -492,11 +504,17 @@ class SimulatedExploreStack:
         self.log.append("skip_area")
         self.skipped.append(name)
 
-    def go_to_mark(self, x: float, y: float, yaw_deg: float) -> None:
-        self.log.append("go_to_mark")
-        self.mark_sent_at = self.clock.now()
+    def go_to_mark(self, x: float, y: float, yaw_deg: float, may_move=None) -> bool:
+        """With ``may_move`` (the job's), checked under `_lock`, the lock `halt` and `hold`
+        stop under: False, logged as refused, and no return when it is false."""
         with self._lock:
+            if may_move is not None and not may_move():
+                self.log.append("go_to_mark refused")
+                return False
+            self.log.append("go_to_mark")
+            self.mark_sent_at = self.clock.now()
             self._returning, self._return_since = True, self.clock.now()
+        return True
 
     def mark_result(self) -> str | None:
         self._advance()

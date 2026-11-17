@@ -507,7 +507,7 @@ def _fake_ros(monkeypatch) -> dict:
     rclpy.signals = signals
     mods = {"rclpy": rclpy, "rclpy.signals": signals}
     for name in ("rclpy.action", "rclpy.executors", "rclpy.node", "rclpy.qos", "rclpy.time",
-                 "diagnostic_msgs", "diagnostic_msgs.msg", "geometry_msgs", "geometry_msgs.msg",
+                 "action_msgs", "action_msgs.msg", "diagnostic_msgs", "diagnostic_msgs.msg", "geometry_msgs", "geometry_msgs.msg",
                  "nav_msgs", "nav_msgs.msg", "nav2_msgs", "nav2_msgs.action", "sensor_msgs",
                  "sensor_msgs.msg", "std_msgs", "std_msgs.msg", "tf2_ros"):
         mods[name] = mock.MagicMock(name=name)

@@ -305,7 +305,9 @@ class ExploreStack(Protocol):
     def reset_costmap(self) -> bool | None: ...
     def read_costmap(self) -> steps.Grid | None: ...
     def read_map(self) -> steps.Grid | None: ...
-    def start_explorer(self) -> bool | None: ...
+    def start_explorer(self, may_move=None) -> bool | None:
+        """Start the explorer. With ``may_move``, the job's (`_Job.may_move`), checked under the
+        lock its stop takes: False and nothing started when it is false."""
     def stop_explorer(self) -> None: ...
     def explorer_status(self) -> str: ...
     def recoveries(self) -> list[tuple[float, float]]:
@@ -320,7 +322,9 @@ class ExploreStack(Protocol):
         be placed (no transform from its frame)."""
     def skip_area(self, name: str) -> None:
         """Send the explorer no further goal into this area."""
-    def go_to_mark(self, x: float, y: float, yaw_deg: float) -> None: ...
+    def go_to_mark(self, x: float, y: float, yaw_deg: float, may_move=None) -> bool:
+        """The return goal. With ``may_move``, the job's, checked under the lock every stop
+        of the robot takes: False and nothing sent when it is false."""
     def mark_result(self) -> str | None:
         """None while the return is under way; then SUCCEEDED, ABORTED, CANCELED or a reason."""
     def save_map(self, name: str) -> SavedMap | None: ...
@@ -715,9 +719,27 @@ class _Job:
         self.limits, self.clock, self._emit = limits, clock, emit
         self.halted = threading.Event()
         self._paused = threading.Event()
+        self._armed = False
+
+    def arm(self) -> None:
+        """Hand the stack this job's halt event, so a stop's `halt` marks this job. The adapter
+        calls it in the step that makes the job current, before its thread starts: a stop in
+        between then marks this job, not the one before it. Never blocks."""
+        self.stack.arm(self.halted)
+        self._armed = True
+
+    def may_move(self) -> bool:
+        """Whether this job may still set the robot moving: not halted and not paused. The
+        stack reads it under the lock its stop takes, just before it sends motion, and every
+        stop and pause sets the flag before it takes that lock; so a motion is either seen by
+        the stop or refused. Reads two flags; never blocks."""
+        return not self.halted.is_set() and not self._paused.is_set()
 
     def run(self) -> None:
-        self.stack.arm(self.halted)
+        if self.halted.is_set():
+            return        # halted before its thread started: no pre-flight, nothing reported
+        if not self._armed:
+            self.arm()    # a job run without the adapter (the adapter arms it before it starts)
         try:
             self._run()
         except Halted:
@@ -782,7 +804,10 @@ class ExploreJob(_Job):
         super().__init__(**kw)
         self.artifacts, self.namespace = artifacts, namespace
         self.phase = "start"
-        self._resume = threading.Event()
+        # Pauses so far, and those the job thread has waited out. `pause` counts and marks;
+        # only `resume` unmarks: the job thread never clears a pause, so one that comes after
+        # a resume, before the thread acts on it, stays a pause.
+        self._pauses = self._pauses_seen = 0
         self._mask: steps.Mask | None = None
         self._bound_m2 = 0.0
         self._covered_m2 = 0.0
@@ -801,15 +826,20 @@ class ExploreJob(_Job):
     # ── pause / resume, from the adapter's control thread ───────────────────
 
     def pause(self) -> None:
-        """Hold: the explorer and the return goal are stopped now; the job waits."""
-        self._resume.clear()
+        """Hold: the explorer and the return goal are stopped now; the job waits. Marked
+        before the stack holds, so a start or a return checked after the hold is refused."""
         self._paused.set()
+        self._pauses += 1
         self.stack.hold()
 
     def resume(self) -> None:
-        self._resume.set()
+        self._paused.clear()
 
     def run(self) -> None:
+        if self.halted.is_set():
+            # Halted before its thread started: it launched nothing, and ending "the segment"
+            # would end the processes of whatever runs now (the job that superseded it).
+            return
         try:
             super().run()
         finally:
@@ -825,14 +855,43 @@ class ExploreJob(_Job):
                 traceback.print_exc(file=sys.stderr)
 
     def _hold_while_paused(self) -> bool:
-        """Wait out a pause. True when one was waited out (the caller restarts its phase)."""
-        if not self._paused.is_set():
+        """Wait out a pause. True when one was waited out, or came and went since the last
+        look (the caller restarts its phase)."""
+        if not self._paused.is_set() and self._pauses == self._pauses_seen:
             return False
-        while not self._resume.is_set():
+        while self._paused.is_set():
             self._wait(LOOP_S)
-        self._paused.clear()
-        self._resume.clear()
+        self._pauses_seen = self._pauses
         return True
+
+    def _go_to_mark(self) -> bool:
+        """Send the return goal unless a stop or a pause came first (`may_move`, checked under
+        the stop's lock). A stop: Halted. A pause: False, and nothing sent; the caller's loop
+        waits the pause out and sends it then."""
+        if self.stack.go_to_mark(*self._mark, self.may_move):
+            return True
+        if self.halted.is_set():
+            raise Halted
+        self._pauses_seen = -1    # refused for a pause: restart the phase, even if it has ended
+        return False
+
+    def _start_explorer(self, what: str) -> steps.ReadVerdict | None:
+        """Start the explorer unless a stop or a pause came first (`may_move`, checked under
+        the explorer's stop lock). A stop: Halted. A pause: None, and nothing started; the
+        caller waits the pause out and starts it then. Otherwise the call's verdict."""
+        pauses = self._pauses
+        v = self._call(lambda: self.stack.start_explorer(self.may_move), what)
+        if v.ok:
+            return v
+        if self.halted.is_set():
+            raise Halted
+        if self._paused.is_set() or self._pauses != pauses:
+            # A pause came first, even one that has ended since (a pause and its resume both
+            # come from the adapter's control thread, so its count is in by the resume).
+            # Restart the phase once it is over.
+            self._pauses_seen = -1
+            return None
+        return v
 
     # ── the segment ─────────────────────────────────────────────────────────
 
@@ -966,9 +1025,12 @@ class ExploreJob(_Job):
         self._covered_m2 = steps.covered_m2(slam, mask)
         self._say("bound proven in the costmap (" + "; ".join(lines) + "); starting the explorer")
 
-        self._hold_while_paused()
-        self.stack.plans()            # paths from before the bound was proven are not this one's
-        v = self._call(self.stack.start_explorer, "explorer start")
+        while True:
+            self._hold_while_paused()
+            self.stack.plans()        # paths from before the bound was proven are not this one's
+            v = self._start_explorer("explorer start")
+            if v is not None:
+                break                 # None: paused before it started; wait it out, then start
         if not v.ok:
             raise _Failed(f"the explorer did not start: {v.summary()}; no motion")
         self._before_motion = False
@@ -1153,7 +1215,9 @@ class ExploreJob(_Job):
         lines = self._reload_and_prove((self._mark[0], self._mark[1]), refused)
         self.stack.plans()            # drawn before the reload: not against this mask
         self.stack.recoveries()       # the stop's own, and the way out's
-        v = self._call(self.stack.start_explorer, "explorer restart")
+        v = self._start_explorer("explorer restart")
+        if v is None:
+            return                    # paused first: the loop starts it once the pause is over
         if not v.ok:
             raise refused(f"the explorer did not start again: {v.summary()}")
         self.phase = steps.EXPLORING
@@ -1185,7 +1249,9 @@ class ExploreJob(_Job):
     def _leave_area(self, area: str, sup: steps.Supervisor) -> None:
         """Back to the mark, the battery and every planned path watched as while exploring.
         Not there: stopped where it stands."""
-        self.stack.go_to_mark(*self._mark)
+        if not self._go_to_mark():
+            raise _StoppedHere(f"paused before the return from {area} was sent; stopped where it "
+                               f"stands, not returned")
         t0 = self.clock.now()
         while True:
             self._check_plans()
@@ -1295,12 +1361,14 @@ class ExploreJob(_Job):
         while True:
             if self._hold_while_paused():
                 if sup.state == steps.EXPLORING:
-                    v = self._call(self.stack.start_explorer, "explorer restart")
+                    v = self._start_explorer("explorer restart")
+                    if v is None:
+                        continue      # paused again before it restarted: wait that one out
                     if not v.ok:
                         raise _Failed(f"the explorer did not restart after the pause: "
                                       f"{v.summary()}")
-                elif sup.state == steps.RETURNING:
-                    self.stack.go_to_mark(*self._mark)
+                elif sup.state == steps.RETURNING and not self._go_to_mark():
+                    continue          # paused again before the return was sent
                 self._say(f"resumed; {sup.state.lower()}")
             self._check_plans()
             now = self.clock.now()
@@ -1331,7 +1399,7 @@ class ExploreJob(_Job):
                 elif act[0] == "cancel_nav":
                     self.stack.hold()
                 elif act[0] == "send_mark":
-                    self.stack.go_to_mark(*self._mark)
+                    self._go_to_mark()    # a pause first: sent once it is waited out
                     self.phase = steps.RETURNING
                     self._say("returning to the mark")
                 elif act[0] == "say" and sup.state == steps.STOPPING:

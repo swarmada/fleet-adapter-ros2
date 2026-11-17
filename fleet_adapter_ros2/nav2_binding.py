@@ -48,6 +48,12 @@ _EPS_LINEAR = 0.01   # m/s
 _EPS_ANGULAR = 0.01  # rad/s
 
 _GS_ABORTED = 6  # action_msgs/GoalStatus: the goal ended in failure
+# action_msgs/GoalStatus values of a goal the navigation server is still running: ACCEPTED,
+# EXECUTING, CANCELING. A goal in any of them can still move the robot.
+_GS_ACTIVE = (1, 2, 3)
+# The NavigateToPose server's goal status topic (rclcpp's action server publishes every
+# goal's status on it, whoever sent the goal).
+NAV_STATUS_TOPIC = "navigate_to_pose/_action/status"
 
 # How often the progress watchdog is evaluated on the executor. How promptly a stall is
 # REPORTED, not what counts as one: a stall is declared at most one period after its window
@@ -228,6 +234,21 @@ class Nav2Binding:
         self._nav_initial: float | None = None  # first distance_remaining (100% baseline)
         self._nav_distance: float | None = None  # latest distance_remaining from feedback
         self._holding = False  # a stop has been commanded; hold until a new goal
+        # THE NAVIGATION SERVER'S OWN VIEW OF ITS GOALS. Not every goal is this binding's: an
+        # exploration stack (explore_lite) sends its own NavigateToPose goals, which are not in
+        # `_unanswered` or `_stop_pending`. One sent just before a stop can be accepted after it
+        # and drive. So the binding reads the server's goal status topic: `_server_active` is
+        # the ids of the goals it lists as still running (None until a status message has
+        # arrived). While `_nav_held`, which every stop sets in `_halt_locked` and only this
+        # binding's own new goal or `release_hold_for_explorer` clears, every goal the server
+        # lists as running is cancelled by its id: at the stop, and as each status shows one.
+        # By id, never "every goal": a cancel of every goal also cancels a goal sent just after
+        # the stop (a new assignment's, a handover's), which the server may take first. And no
+        # rest is confirmed while the server runs any goal.
+        self._nav_held = False
+        self._server_active: frozenset | None = None
+        self._status_sub = None   # the status subscription, made in start()
+        self._status_unseen = 0   # 0 nothing to say, 1 to say (outside the lock), 2 said
         self._node = None  # rclpy node, created in start()
         self._action_client = None   # NavigateToPose ActionClient (start())
         self._cmd_vel = None         # geometry_msgs/Twist publisher (halt on cancel)
@@ -541,20 +562,57 @@ class Nav2Binding:
         the target is dispatched to the Nav2 action server; without one, it is only
         cached so the translation is unit-testable at $0."""
         with self._lock:
-            self._goal = task_map.GoalPose(x=x, y=y, yaw=yaw)
-            self._holding = False  # a new goal releases a prior hold
-            self._goal_status = 0  # new goal in-flight → RUNNING
-            self._nav_initial = None  # progress baseline reset for the new goal
-            self._nav_distance = None
-            self._goal_epoch += 1
-            epoch = self._goal_epoch
-            self._failure = ""
-            if self._watchdog is not None:
-                self._watchdog.arm()  # from dispatch: a goal that never reports is watched too
-            goal = self._goal
-            live = self._register_locked(epoch)
+            live, goal, epoch = self._move_locked(x, y, yaw)
         if live:
             self._dispatch(goal, epoch)
+
+    def command_move_if(self, robot_id: str, x: float, y: float, yaw: float,
+                        may_move) -> bool:
+        """`command_move`, unless ``may_move()`` is false when this binding's lock is held:
+        then nothing is sent or recorded, and False is returned.
+
+        An exploration segment's return goal comes here. Every stop and every pause marks the
+        segment's job (halted, paused) BEFORE it takes this lock to stop the robot, so the
+        check and the goal are one step against it: either the goal is recorded first, and the
+        stop finds it and cancels it, or the mark is seen and the goal is never sent. A check
+        made on the job's own thread before the call would leave a gap between the two.
+        ``may_move`` reads flags only; it never blocks."""
+        with self._lock:
+            if not may_move():
+                return False
+            live, goal, epoch = self._move_locked(x, y, yaw)
+        if live:
+            self._dispatch(goal, epoch)
+        return True
+
+    def release_hold_for_explorer(self, robot_id: str, may_move) -> bool:
+        """Let the exploration stack's own goals run: the hold a stop or a pause set stops
+        cancelling every goal the server shows running. Unless ``may_move()`` is false under
+        this binding's lock (the segment was stopped or paused first): then the hold stays and
+        False is returned. The stack calls this before it tells the explorer to start, and a
+        stop after it sets the hold again (`_halt_locked`)."""
+        with self._lock:
+            if not may_move():
+                return False
+            self._nav_held = False
+            return True
+
+    def _move_locked(self, x: float, y: float, yaw: float):
+        """Make (x, y, yaw) the goal, under ``self._lock``: (live, goal, epoch)."""
+        self._goal = task_map.GoalPose(x=x, y=y, yaw=yaw)
+        self._holding = False  # a new goal releases a prior hold
+        self._nav_held = False
+        self._goal_status = 0  # new goal in-flight → RUNNING
+        self._nav_initial = None  # progress baseline reset for the new goal
+        self._nav_distance = None
+        self._goal_epoch += 1
+        epoch = self._goal_epoch
+        self._failure = ""
+        if self._watchdog is not None:
+            self._watchdog.arm()  # from dispatch: a goal that never reports is watched too
+        goal = self._goal
+        live = self._register_locked(epoch)
+        return live, goal, epoch
 
     def _register_locked(self, epoch: int) -> bool:
         """Record a goal as unanswered in the same step that makes it the current goal, so a
@@ -801,6 +859,7 @@ class Nav2Binding:
         if close_gate:
             self._teleop.close(why)
         self._holding = True
+        self._nav_held = True
         handle, self._goal_handle = self._goal_handle, None
         if self._parked is not None:
             # Never sent: withdrawn here, with nothing to cancel and nothing to wait for.
@@ -817,7 +876,10 @@ class Nav2Binding:
         that holds; False if a goal the server may still accept and drive remains. Nothing
         may report the robot stopped, or an action stopped safely, while this is False."""
         with self._settled:
-            return self._settled.wait_for(lambda: not self._stop_pending, timeout)
+            settled = self._settled.wait_for(
+                lambda: not self._stop_pending and not self._server_running_locked(), timeout)
+        self._say_status_unseen()
+        return settled
 
     def command_pause(self, robot_id: str) -> None:
         """Pause navigation: cancel the active NavigateToPose goal so the base halts,
@@ -836,6 +898,8 @@ class Nav2Binding:
         with self._lock:
             goal = self._goal
             self._holding = False
+            if goal is not None:
+                self._nav_held = False
             self._goal_status = 0  # re-dispatched goal is in-flight again
             # The goal cancelled by command_pause will deliver a CANCELED result; it must
             # not be attributed to the goal being resumed here.
@@ -1201,6 +1265,67 @@ class Nav2Binding:
         finally:
             if self._cmd_vel is not None and self._twist_type is not None:
                 self._cmd_vel.publish(self._twist_type())
+            self._cancel_running_goals_if_held()   # never raises
+
+    def on_nav_status(self, goals) -> None:
+        """The navigation server's goal status (``action_msgs/GoalStatusArray`` on
+        `NAV_STATUS_TOPIC`), as (goal id, status) pairs for every goal it lists, whoever sent
+        it. Also the test entry point.
+
+        Records which goals the server still runs. While a stop or a pause holds the robot
+        (`_nav_held`), each goal a status shows running is cancelled by its id: a goal the
+        exploration stack sent just before the stop, accepted after it, is cancelled as soon as
+        the server says it runs."""
+        active = frozenset(bytes(goal_id) for goal_id, status in goals if status in _GS_ACTIVE)
+        with self._lock:
+            self._server_active = active
+            cancel = active if self._nav_held else frozenset()
+            self._settled.notify_all()
+        self._cancel_goals(cancel)
+
+    def _server_running_locked(self) -> bool:
+        """Whether the navigation server's latest status lists a goal still running. False
+        when no status has arrived yet, said once (by `_say_status_unseen`, outside the lock):
+        the rule then rests on this binding's own goals alone."""
+        if self._server_active is None:
+            if self._status_unseen == 0 and self._status_sub is not None:
+                self._status_unseen = 1
+            return False
+        return bool(self._server_active)
+
+    def _say_status_unseen(self) -> None:
+        """Say once, holding no lock, that no goal status has arrived (`_server_running_locked`)."""
+        with self._lock:
+            say = self._status_unseen == 1
+            if say:
+                self._status_unseen = 2
+        if say:
+            print(f"nav2: no goal status from {NAV_STATUS_TOPIC} yet; a goal another sender gave "
+                  f"the navigation server is not seen until one arrives", file=sys.stderr)
+
+    def _cancel_running_goals_if_held(self) -> None:
+        """After a stop's own cancel: every goal the server lists as running, whoever sent it,
+        by its id, while the robot is held (once start() has subscribed to the status). The ids
+        are taken under the lock in the step that reads the hold, so a goal sent after a
+        release is never among them."""
+        with self._lock:
+            held = self._nav_held and self._status_sub is not None
+            ids = (self._server_active or frozenset()) if held else frozenset()
+        self._cancel_goals(ids)
+
+    def _cancel_goals(self, ids) -> None:
+        """A CancelGoal for each of these goal ids. A stop path: a cancel that raises is
+        reported, never raised, and the others are still sent."""
+        for goal_id in sorted(ids):
+            try:
+                self._cancel_running_goal(goal_id)
+            except Exception as exc:  # noqa: BLE001 - a stop path: report, never raise
+                print(f"stop: cancelling a goal the navigation server runs raised "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+    def _cancel_running_goal(self, goal_id: bytes) -> None:  # pragma: no cover — ROS 2 runtime
+        from unique_identifier_msgs.msg import UUID
+        self._cancel_goal_by_id(UUID(uuid=list(goal_id)))
 
     def tick(self, dt: float) -> None:
         """rclpy spins its own executor, so there is no model to advance -- but this
@@ -1315,7 +1440,9 @@ class Nav2Binding:
         cannot distinguish a robot that stopped from one that was told to
         (:meth:`rest_evidence_gap`)."""
         with self._lock:
-            return self._at_rest_locked()
+            at_rest = self._at_rest_locked()
+        self._say_status_unseen()
+        return at_rest
 
     def _at_rest_locked(self) -> bool:
         """:meth:`is_stopped`, for a caller that holds ``self._lock``."""
@@ -1326,6 +1453,10 @@ class Nav2Binding:
             # A goal sent before the stop has not been answered: the server may still
             # accept it and drive. Refute wins -- whatever odom says now, rest cannot be
             # confirmed until that goal is refused or cancelled on arrival.
+            return False
+        if self._server_running_locked():
+            # The navigation server still runs a goal, this binding's or another sender's
+            # (the explorer's): it can drive the robot whatever odom reads now.
             return False
         if self._spin_fault is not None:
             # The executor is dead, so `speed` is whatever odom last said before it
@@ -1354,6 +1485,7 @@ class Nav2Binding:
             import threading
 
             import rclpy
+            from action_msgs.msg import GoalStatusArray
             from diagnostic_msgs.msg import DiagnosticArray
             from geometry_msgs.msg import Twist
             from nav_msgs.msg import Odometry
@@ -1363,7 +1495,7 @@ class Nav2Binding:
             from rclpy.node import Node
             from rclpy.signals import SignalHandlerOptions
             from rclpy.time import Time
-            from rclpy.qos import qos_profile_sensor_data
+            from rclpy.qos import qos_profile_action_status_default, qos_profile_sensor_data
             from sensor_msgs.msg import BatteryState, LaserScan
             from std_msgs.msg import Empty, UInt16
             from tf2_ros import Buffer, TransformException, TransformListener
@@ -1401,6 +1533,12 @@ class Nav2Binding:
 
         self._cmd_vel = node.create_publisher(Twist, "cmd_vel", 10)
         self._action_client = ActionClient(node, NavigateToPose, "navigate_to_pose")
+        # Every goal the server runs, this binding's or another sender's (on_nav_status).
+        self._status_sub = node.create_subscription(
+            GoalStatusArray, NAV_STATUS_TOPIC,
+            lambda m: self.on_nav_status([(s.goal_info.goal_id.uuid, s.status)
+                                          for s in m.status_list]),
+            qos_profile_action_status_default)
         self._nav_action = NavigateToPose
         self._twist_type = Twist
         if self._rest_scan_topic is not None:
