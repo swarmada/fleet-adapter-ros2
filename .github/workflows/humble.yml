@@ -62,13 +62,14 @@ jobs:
           echo /opt/venv/bin >> "$GITHUB_PATH"
       - name: The installed copy works, outside the checkout
         # So that packaging cannot regress: the installed package imports, its vendored stubs
-        # with it, and the console script starts. --help ends before main() imports the stubs,
-        # so they are imported here too.
+        # and bundled scenarios with it, and the console script starts. --help ends before main()
+        # imports the stubs or loads a scenario, so both are checked here too.
         working-directory: /tmp
         run: |
           echo "python3 is $(command -v python3)"
           python3 -c "import fleet_adapter_ros2, swarmada_sdk; print('installed:', fleet_adapter_ros2.__file__, swarmada_sdk.__file__)"
           python3 -c "import fleet_adapter_ros2.adapter; from fleet_adapter.v1 import fleet_adapter_pb2, fleet_adapter_pb2_grpc; print('installed stubs:', fleet_adapter_pb2.__file__)"
+          python3 -c "from fleet_adapter_ros2.scenarios.loader import available_presets, load_scenario; p = available_presets(); assert 'healthy-fleet' in p, p; load_scenario('healthy-fleet'); print('installed presets:', p)"
           fleet-adapter-ros2 --help > /dev/null
           echo "console script: $(command -v fleet-adapter-ros2) --help ok"
       - name: The vendored stubs load on the floor protobuf
@@ -87,13 +88,22 @@ jobs:
           source /opt/ros/humble/setup.bash
           python3 -m pytest tests/test_rclpy_odom_counts.py -v
       - name: Conformance on Python 3.10 (RFC-0001 v0.4, suite 2026.10.22.2), the installed adapter
-        # grpcio-tools, which the harness compiles its stubs with, cannot be installed at
-        # protobuf 3.20.3, so this step runs after it and the protobuf it brings. The adapter is
-        # the installed console script, not the checkout's adapter.py.
+        # The harness runs in a venv of its own: its stubs (checked in at the tag) were generated
+        # for protobuf 5.26.1 and grpcio 1.64.1, and installing those into the ROS venv would
+        # lift the adapter off its declared floor and setuptools past colcon-core's <80. The
+        # adapter is the installed console script on PATH, from the ROS venv, at the floor.
         working-directory: swarmada-src
         run: |
-          python3 -m pip install grpcio-tools
-          python3 -m adapters.conformance \
+          python3 -m venv /opt/harness
+          /opt/harness/bin/python -m pip install 'grpcio>=1.64.1' 'protobuf>=5.26.1'
+          echo "adapter: $(command -v fleet-adapter-ros2)"
+          /opt/harness/bin/python -m adapters.conformance \
             --stub-path proto \
             --adapter-name fleet-adapter-ros2 \
             --adapter-cmd "fleet-adapter-ros2 --endpoint localhost:{port} --binding simulated"
+      - name: The ROS venv is still at the floor
+        # Nothing after the install may move it: colcon-core needs setuptools<80, and the
+        # adapter is declared to run at protobuf 3.20.3 and grpcio 1.64.1.
+        if: always()
+        run: |
+          python3 -c "import importlib.metadata as m, sys; v = {d: m.version(d) for d in ('setuptools', 'protobuf', 'grpcio')}; print('ROS venv:', v); sys.exit(0 if int(v['setuptools'].split('.')[0]) < 80 and v['protobuf'] == '3.20.3' and v['grpcio'] == '1.64.1' else 'FAILED: the ROS venv moved off its floor')"
