@@ -224,6 +224,10 @@ def test_the_feed_writes_only_lawful_sequences_over_many_runs() -> None:
         res, msgs = assign(a, payload(last=i == 4))
         assert res.accepted
         collect(a, msgs, turned)
+        # The feed looks every 0.1 s. Whether a look falls between the gate's turn and the
+        # stop is timing, and both outcomes are lawful; so each run waits for the operator's
+        # turn to be written, and the sequences below do not depend on it.
+        wait_states(sink, lambda s: s[-1:] == [OPERATOR])
         if stop:
             STOPS[stop](a)
         else:
@@ -233,7 +237,8 @@ def test_the_feed_writes_only_lawful_sequences_over_many_runs() -> None:
         settle(a, msgs, 0.3)
         assert lawful(states(sink)), states(sink)
         seen.append(tuple(seq))
-    assert len(set(seen)) == 3
+    assert set(seen) == {(ROBOT_, OPERATOR, STOPPED), (ROBOT_, OPERATOR, REACHED),
+                         (ROBOT_, OPERATOR, REACHED, DONE)}, seen
 
 
 def test_robot_is_written_first_even_when_the_feed_thread_starts_after_the_gate_turned(
