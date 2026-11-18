@@ -26,6 +26,7 @@ import math
 import sys
 import threading
 import time
+import uuid
 
 from fleet_adapter_ros2 import manual_drive, operator_ready, scan_rest, telemetry
 from fleet_adapter_ros2 import task as task_map
@@ -47,7 +48,10 @@ STALE_FEEDBACK_MARGIN_M = 0.10
 _EPS_LINEAR = 0.01   # m/s
 _EPS_ANGULAR = 0.01  # rad/s
 
+_GS_SUCCEEDED = 4  # action_msgs/GoalStatus: the goal reached its target
 _GS_ABORTED = 6  # action_msgs/GoalStatus: the goal ended in failure
+# How many of this binding's own goal ids it keeps (`_own_ids`): far more than can run at once.
+_OWN_IDS_KEPT = 256
 # action_msgs/GoalStatus values of a goal the navigation server is still running: ACCEPTED,
 # EXECUTING, CANCELING. A goal in any of them can still move the robot.
 _GS_ACTIVE = (1, 2, 3)
@@ -250,6 +254,19 @@ class Nav2Binding:
         # rest is confirmed while the server runs any goal.
         self._nav_held = False
         self._server_active: frozenset | None = None
+        # GOALS THIS BINDING DID NOT SEND, WHILE ITS OWN GOAL RUNS. Another sender's goal can
+        # take the navigation server over from this binding's: an explorer goal sent just
+        # before an assignment superseded its segment and accepted after the assignment's goal,
+        # or an operator's. From the binding's own goal on (`_guard_foreign`) every goal the
+        # server lists as running that this binding did not send is cancelled by its id: as
+        # the goal is sent, and as each status shows one. Until the goal succeeds, the explorer
+        # is released (`release_hold_for_explorer`), or the robot is held (then every goal is
+        # cancelled). A goal of ours that fails or is cancelled keeps the guard: the server ends
+        # ours when a later goal preempts it. `_own_ids`: the ids of the goals this binding
+        # sent, each claimed before its send (`_claim_goal_id`).
+        self._guard_foreign = False
+        self._own_ids: dict[bytes, None] = {}
+        self._claimed: dict[int, bytes] = {}   # epoch -> the id its goal is sent with
         self._status_sub = None   # the status subscription, made in start()
         self._status_unseen = 0   # 0 nothing to say, 1 to say (outside the lock), 2 said
         self._node = None  # rclpy node, created in start()
@@ -568,6 +585,7 @@ class Nav2Binding:
             live, goal, epoch = self._move_locked(x, y, yaw)
         if live:
             self._dispatch(goal, epoch)
+        self._cancel_foreign_goals()
 
     def command_move_if(self, robot_id: str, x: float, y: float, yaw: float,
                         may_move) -> bool:
@@ -586,6 +604,7 @@ class Nav2Binding:
             live, goal, epoch = self._move_locked(x, y, yaw)
         if live:
             self._dispatch(goal, epoch)
+        self._cancel_foreign_goals()
         return True
 
     def release_hold_for_explorer(self, robot_id: str, may_move) -> bool:
@@ -598,6 +617,7 @@ class Nav2Binding:
             if not may_move():
                 return False
             self._nav_held = False
+            self._guard_foreign = False   # the explorer's own goals run now
             return True
 
     def _move_locked(self, x: float, y: float, yaw: float):
@@ -605,6 +625,7 @@ class Nav2Binding:
         self._goal = task_map.GoalPose(x=x, y=y, yaw=yaw)
         self._holding = False  # a new goal releases a prior hold
         self._nav_held = False
+        self._guard_foreign = True  # no other sender's goal runs in its place
         self._goal_status = 0  # new goal in-flight → RUNNING
         self._nav_initial = None  # progress baseline reset for the new goal
         self._nav_distance = None
@@ -676,6 +697,7 @@ class Nav2Binding:
                 self._settled.notify_all()
             if start:
                 self._answer_watch.start()
+        self._claim_goal_id(epoch)   # ours before the server can list it
         try:
             self._send_nav2_goal(goal, epoch)
         except BaseException as exc:
@@ -903,6 +925,7 @@ class Nav2Binding:
             self._holding = False
             if goal is not None:
                 self._nav_held = False
+                self._guard_foreign = True
             self._goal_status = 0  # re-dispatched goal is in-flight again
             # The goal cancelled by command_pause will deliver a CANCELED result; it must
             # not be attributed to the goal being resumed here.
@@ -913,6 +936,8 @@ class Nav2Binding:
             live = goal is not None and self._register_locked(epoch)
         if live:
             self._dispatch(goal, epoch)
+        if goal is not None:
+            self._cancel_foreign_goals()
 
     # ── manual-drive: teleop, only through the gate ─────────────────────────────
 
@@ -1114,6 +1139,8 @@ class Nav2Binding:
             if epoch is not None and epoch != self._goal_epoch:
                 return
             self._goal_status = status
+            if status == _GS_SUCCEEDED:
+                self._guard_foreign = False   # reached: no other sender's goal is ours to stop
             if status == _GS_ABORTED and not self._failure:
                 # Why the goal failed, for the FAILED report: the server's own verdict.
                 self._failure = reason or "the navigation server aborted the goal"
@@ -1176,8 +1203,6 @@ class Nav2Binding:
     def _send_nav2_goal(self, goal: task_map.GoalPose, epoch: int) -> None:  # pragma: no cover — ROS 2 runtime
         # Build a NavigateToPose goal (PoseStamped, yaw→quaternion) and dispatch it
         # via the action client; feedback → on_feedback (progress), result → on_goal_result.
-        import uuid
-
         from geometry_msgs.msg import PoseStamped
 
         nav_goal = self._nav_action.Goal()
@@ -1194,7 +1219,7 @@ class Nav2Binding:
         # The goal's id is chosen here, not by rclpy, so that a goal whose answer never comes
         # can still be cancelled by it (`_abandon_locked`).
         from unique_identifier_msgs.msg import UUID
-        goal_id = UUID(uuid=list(uuid.uuid4().bytes))
+        goal_id = UUID(uuid=list(self._claim_goal_id(epoch)))
         with self._lock:
             if self._response_bound is not None and epoch in self._sent_at:
                 self._goal_ids[epoch] = goal_id
@@ -1294,7 +1319,7 @@ class Nav2Binding:
         active = frozenset(bytes(goal_id) for goal_id, status in goals if status in _GS_ACTIVE)
         with self._lock:
             self._server_active = active
-            cancel = active if self._nav_held else frozenset()
+            cancel = active if self._nav_held else self._foreign_running_locked()
             self._settled.notify_all()
         self._cancel_goals(cancel)
 
@@ -1326,6 +1351,36 @@ class Nav2Binding:
         with self._lock:
             held = self._nav_held and self._status_sub is not None
             ids = (self._server_active or frozenset()) if held else frozenset()
+        self._cancel_goals(ids)
+
+    def _claim_goal_id(self, epoch: int) -> bytes:
+        """The id the goal of ``epoch`` is sent with: chosen here, and recorded as this
+        binding's own before it is sent, so no status can list it as another sender's. The same
+        id for the same epoch."""
+        with self._lock:
+            raw = self._claimed.get(epoch)
+            if raw is None:
+                raw = uuid.uuid4().bytes
+                self._claimed[epoch] = raw
+                self._own_ids[raw] = None
+                while len(self._own_ids) > _OWN_IDS_KEPT:
+                    self._own_ids.pop(next(iter(self._own_ids)))
+                while len(self._claimed) > _OWN_IDS_KEPT:
+                    self._claimed.pop(next(iter(self._claimed)))
+            return raw
+
+    def _foreign_running_locked(self) -> frozenset:
+        """Under the lock: while `_guard_foreign` holds, the goals the server lists as running
+        that this binding did not send; otherwise none."""
+        if not self._guard_foreign:
+            return frozenset()
+        return frozenset(g for g in (self._server_active or ()) if g not in self._own_ids)
+
+    def _cancel_foreign_goals(self) -> None:
+        """After this binding's own goal is sent: every goal of another sender the server
+        lists as running, cancelled by its id (`_guard_foreign`)."""
+        with self._lock:
+            ids = self._foreign_running_locked()
         self._cancel_goals(ids)
 
     def _cancel_goals(self, ids) -> None:
