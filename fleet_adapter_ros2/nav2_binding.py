@@ -265,6 +265,17 @@ class Nav2Binding:
         # ours when a later goal preempts it. `_own_ids`: the ids of the goals this binding
         # sent, each claimed before its send (`_claim_goal_id`).
         self._guard_foreign = False
+        # A GOAL THAT SUPERSEDES A SEGMENT KEEPS THE GUARD PAST ITS SUCCEEDED. The segment's
+        # explorer may have sent a goal just before it was told to stop, accepted only after
+        # this binding's goal has already succeeded (a goal the robot was at): lifting the
+        # guard at SUCCEEDED let that goal drive a robot with no action. `_explorer_live`: an
+        # explorer was released and its segment's processes have not been ended since, plus
+        # the settle (`explorer_ended`, `_explorer_quiet_at`). A goal sent while it holds keeps
+        # the guard past its SUCCEEDED (`_guard_kept`) until then; a new goal, an explorer
+        # release or a hold ends that earlier, as each ends the guard's ordinary span.
+        self._explorer_live = False
+        self._explorer_quiet_at: float | None = None
+        self._guard_kept = False
         self._own_ids: dict[bytes, None] = {}
         self._claimed: dict[int, bytes] = {}   # epoch -> the id its goal is sent with
         self._status_sub = None   # the status subscription, made in start()
@@ -618,7 +629,28 @@ class Nav2Binding:
                 return False
             self._nav_held = False
             self._guard_foreign = False   # the explorer's own goals run now
+            self._guard_kept = False
+            self._explorer_live, self._explorer_quiet_at = True, None
             return True
+
+    def explorer_ended(self, robot_id: str, settle_s: float) -> None:
+        """The exploration stack ended a segment's processes, the explorer's among them: once
+        ``settle_s`` has passed, no goal of that explorer can still arrive, and a goal that
+        kept the guard past its SUCCEEDED lets it go. Never waits; never raises."""
+        with self._lock:
+            if self._explorer_live:
+                self._explorer_quiet_at = self._now() + settle_s
+
+    def _explorer_settled_locked(self) -> None:
+        """Under the lock: once the ended explorer's settle has passed, it is no longer live,
+        and a guard kept only for it is lifted if its goal has succeeded."""
+        if self._explorer_quiet_at is None or self._now() < self._explorer_quiet_at:
+            return
+        self._explorer_live, self._explorer_quiet_at = False, None
+        if self._guard_kept:
+            self._guard_kept = False
+            if self._goal_status == _GS_SUCCEEDED:
+                self._guard_foreign = False
 
     def _move_locked(self, x: float, y: float, yaw: float):
         """Make (x, y, yaw) the goal, under ``self._lock``: (live, goal, epoch)."""
@@ -626,6 +658,8 @@ class Nav2Binding:
         self._holding = False  # a new goal releases a prior hold
         self._nav_held = False
         self._guard_foreign = True  # no other sender's goal runs in its place
+        self._explorer_settled_locked()
+        self._guard_kept = self._explorer_live  # it supersedes a segment whose explorer may send
         self._goal_status = 0  # new goal in-flight → RUNNING
         self._nav_initial = None  # progress baseline reset for the new goal
         self._nav_distance = None
@@ -885,6 +919,7 @@ class Nav2Binding:
             self._teleop.close(why)
         self._holding = True
         self._nav_held = True
+        self._guard_kept = False   # held: every goal is cancelled now, not only others'
         handle, self._goal_handle = self._goal_handle, None
         if self._parked is not None:
             # Never sent: withdrawn here, with nothing to cancel and nothing to wait for.
@@ -926,6 +961,8 @@ class Nav2Binding:
             if goal is not None:
                 self._nav_held = False
                 self._guard_foreign = True
+                self._explorer_settled_locked()
+                self._guard_kept = self._explorer_live
             self._goal_status = 0  # re-dispatched goal is in-flight again
             # The goal cancelled by command_pause will deliver a CANCELED result; it must
             # not be attributed to the goal being resumed here.
@@ -1139,7 +1176,7 @@ class Nav2Binding:
             if epoch is not None and epoch != self._goal_epoch:
                 return
             self._goal_status = status
-            if status == _GS_SUCCEEDED:
+            if status == _GS_SUCCEEDED and not self._guard_kept:
                 self._guard_foreign = False   # reached: no other sender's goal is ours to stop
             if status == _GS_ABORTED and not self._failure:
                 # Why the goal failed, for the FAILED report: the server's own verdict.
@@ -1372,6 +1409,7 @@ class Nav2Binding:
     def _foreign_running_locked(self) -> frozenset:
         """Under the lock: while `_guard_foreign` holds, the goals the server lists as running
         that this binding did not send; otherwise none."""
+        self._explorer_settled_locked()
         if not self._guard_foreign:
             return frozenset()
         return frozenset(g for g in (self._server_active or ()) if g not in self._own_ids)
