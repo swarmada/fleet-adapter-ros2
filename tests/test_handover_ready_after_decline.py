@@ -98,6 +98,7 @@ class _Rig:
         lidar, plant = Lidar(seed=96), Plant()
         while not self.stop.is_set():
             self.b.on_scan(_laser(lidar.cast(plant, time.monotonic())))
+            self.b.on_odom(_odom(0.0))           # the base's odometry streams with the scan
             time.sleep(0.1)
 
     def _renewals(self) -> None:

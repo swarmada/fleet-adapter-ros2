@@ -467,6 +467,7 @@ def _held_nav2(T, source="command-derived"):  # noqa: F811
     decline(b)
     b.on_odom(_odom(0.0))
     assert b.hold_for_handover(ROBOT, ACTION)
+    b.on_odom(_odom(0.0))  # the first odometry after the hold
     drive.decline(0.0, WHY)
     return b, drive, clock
 
@@ -554,6 +555,8 @@ def test_with_the_operator_source_an_estop_is_still_failed_on_command_derived(
     b.on_odom(_odom(0.0))
     with b._lock:
         b._handover_hold_at = time.monotonic() - 10.0
+        b._handover_hold_seq = b._odom_count   # as `hold_for_handover` records both
+    b.on_odom(_odom(0.0))  # the first odometry after the hold
     stop = threading.Event()
     lidar, plant = Lidar(seed=96), Plant()
 
@@ -615,7 +618,7 @@ def test_the_estops_test_names_neither_the_ready_nor_the_scan(fn) -> None:
     names = {n.attr for n in ast.walk(ast.parse(src.strip())) if isinstance(n, ast.Attribute)}
     names |= {n.id for n in ast.walk(ast.parse(src.strip())) if isinstance(n, ast.Name)}
     assert not names & {"_ready", "_scan_rest", "on_ready", "take_ready", "handover_at_rest",
-                        "_handover_at_rest_locked", "_handover_hold_at"}
+                        "_handover_at_rest_locked", "_handover_hold_at", "_handover_hold_seq"}
 
 
 # ── the ready sources: a desk one and a ROS one ───────────────────────────────
