@@ -111,3 +111,20 @@ def test_each_advertised_edge_node_is_dialled_once(monkeypatch):
     a._edge_addr.put("edge:3")                              # wakes the loop, which exits
     t.join(1.0)
     assert not t.is_alive() and "edge:3" not in dialled
+
+
+def test_the_edge_channel_pings_so_a_silently_dead_stream_ends(monkeypatch):
+    """An idle EdgeStream sends nothing: without keepalive a stream whose peer vanished never
+    ends, and is never redialled. The interval is the one the edge node accepts (grpc-go's
+    default enforcement: no sooner than 5 minutes on a stream it writes nothing to)."""
+    made: list = []
+    monkeypatch.setattr(adapter_mod.grpc, "insecure_channel",
+                        lambda addr, options=(): made.append(dict(options)) or object())
+    a = _adapter(SimulatedRobot())
+    a._pb_grpc = NS(EdgeServiceStub=lambda channel: NS(EdgeStream=lambda requests: iter(())))
+    a._edge_stream("edge:1")
+    assert len(made) == 1
+    opts = made[0]
+    assert 300_000 < opts.get("grpc.keepalive_time_ms", 0) <= 330_000, opts
+    assert 0 < opts.get("grpc.keepalive_timeout_ms", 0) <= 30_000, opts
+    assert opts.get("grpc.http2.max_pings_without_data") == 0, opts

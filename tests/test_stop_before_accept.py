@@ -271,7 +271,7 @@ def test_an_edge_estop_before_accept_takes_the_same_path(monkeypatch):
 
     stubs = []
     grpc_mod = NS(EdgeServiceStub=lambda ch: stubs.append(_EdgeStub(ch)) or stubs[-1])
-    monkeypatch.setattr(adapter_mod.grpc, "insecure_channel", lambda addr: object())
+    monkeypatch.setattr(adapter_mod.grpc, "insecure_channel", lambda addr, **kw: object())
     a, b, sent = _rig()
     a._pb_grpc = grpc_mod
     _assign(a)

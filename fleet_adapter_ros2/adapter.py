@@ -125,6 +125,21 @@ _RETRY_ENDINGS = {
 }
 
 
+# gRPC keepalive on the EdgeStream's channel. The adapter sends nothing on an idle EdgeStream, so a
+# stream whose peer vanished (the edge node's host lost power, a partition healed after the node
+# dropped its side) never ends and is never redialled, and no later edge estop reaches the robot.
+# A keepalive ping unanswered within the timeout ends it, and `_edge_redial` dials again. The
+# reference edge node runs grpc-go's default enforcement: a ping sooner than 5 minutes after the
+# last (2 hours, with no stream open) is a strike, only the server's own writes clear strikes, and
+# more than two close the connection. So the interval is 5 minutes and 10 seconds, and a dead
+# stream is seen within about 330 s. Without max_pings_without_data 0 the client stops pinging
+# after two pings with no data sent.
+_EDGE_KEEPALIVE = (
+    ("grpc.keepalive_time_ms", 310_000),
+    ("grpc.keepalive_timeout_ms", 20_000),
+    ("grpc.http2.max_pings_without_data", 0),
+)
+
 # Where an edge estop's local latch is kept, on the robot's own disk (`--edge-latch-file`).
 # `{robot_id}` is replaced by the robot's ID. The adapter does not start while the file is there
 # (`_edge_latch_refusal`); removing it on the robot is the latch's only reset.
@@ -2599,7 +2614,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         """One EdgeStream to the edge node at `addr`, until it ends."""
         pb = self._pb
         # TODO(vendor): use grpc.secure_channel with mTLS, same discipline as ControlStream.
-        channel = grpc.insecure_channel(addr)
+        channel = grpc.insecure_channel(addr, options=_EDGE_KEEPALIVE)
         estub = self._pb_grpc.EdgeServiceStub(channel)
         outbox: queue.Queue = queue.Queue()
         # C8.2: tee one PositionFrame so the edge node has a pose to evaluate, fire-and-forget.
