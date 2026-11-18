@@ -140,6 +140,22 @@ _EDGE_KEEPALIVE = (
     ("grpc.http2.max_pings_without_data", 0),
 )
 
+# gRPC keepalive on the control channel, which carries the ControlStream and the SafetyStream on one
+# connection. The control plane sends nothing periodic on the SafetyStream, so after a silent loss
+# of the path the adapter went on counting the estop path up until TCP gave up retransmitting its
+# telemetry (about 15 minutes on Linux): a ping unanswered within the timeout now ends both streams,
+# and the robot is stopped and both are redialled, within about 330 s. 5 minutes and 10 seconds,
+# as on the edge channel: the control plane's server runs grpc-go's default enforcement. And, as
+# there, the client keeps pinging with no data sent: telemetry and lease answers normally keep data
+# flowing, but a telemetry thread that has ended, under a long lease, would leave none, and the
+# client stops pinging after two pings without it.
+_CONTROL_KEEPALIVE = (
+    ("grpc.keepalive_time_ms", 310_000),
+    ("grpc.keepalive_timeout_ms", 20_000),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.http2.max_pings_without_data", 0),
+)
+
 # Where an edge estop's local latch is kept, on the robot's own disk (`--edge-latch-file`).
 # `{robot_id}` is replaced by the robot's ID. The adapter does not start while the file is there
 # (`_edge_latch_refusal`); removing it on the robot is the latch's only reset.
@@ -2729,13 +2745,13 @@ def open_control_channel(args, grpc_mod=None):
     the conformance harness serves."""
     g = grpc_mod or grpc
     if not args.tls_cert:
-        return g.insecure_channel(args.endpoint)
+        return g.insecure_channel(args.endpoint, options=_CONTROL_KEEPALIVE)
     creds = g.ssl_channel_credentials(root_certificates=_tls_material(args.tls_ca),
                                       private_key=_tls_material(args.tls_key),
                                       certificate_chain=_tls_material(args.tls_cert))
-    options = ()
+    options = _CONTROL_KEEPALIVE
     if args.tls_server_name:
-        options = (("grpc.ssl_target_name_override", args.tls_server_name),)
+        options += (("grpc.ssl_target_name_override", args.tls_server_name),)
     return g.secure_channel(args.endpoint, creds, options=options)
 
 
