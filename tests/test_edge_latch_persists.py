@@ -171,7 +171,8 @@ def test_the_latch_files_directory_is_synced_after_the_rename(monkeypatch, tmp_p
     a._persist_edge_latch()
     monkeypatch.undo()
     assert latch.exists()
-    assert events[-2:] == [("replace", str(latch)), ("fsync", str(latch.parent))], events
+    after = events[events.index(("replace", str(latch))) + 1:]
+    assert ("fsync", str(latch.parent)) in after, events
 
 
 def test_an_empty_latch_file_is_said_at_start(monkeypatch, capsys):
@@ -190,3 +191,46 @@ def test_an_empty_latch_file_is_said_at_start(monkeypatch, capsys):
         adapter_mod.main()
     assert seen["edge_latch_file"] is None
     assert "edge estop latch: NOT kept on disk" in capsys.readouterr().err
+
+
+def test_the_directories_the_write_creates_are_synced_in_their_parents(monkeypatch, tmp_path):
+    """On a fresh robot the first write creates the latch's directories: each new entry is
+    synced in its parent, so a power loss cannot drop a new directory with the file in it."""
+    latch = tmp_path / "a" / "b" / "edge-latch"
+    synced: list = []
+    real_open, real_fsync = adapter_mod.os.open, adapter_mod.os.fsync
+    opened: dict = {}
+
+    def record_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        opened[fd] = str(path)
+        return fd
+
+    def record_fsync(fd):
+        if fd in opened:
+            synced.append(opened[fd])
+        return real_fsync(fd)
+    monkeypatch.setattr(adapter_mod.os, "open", record_open)
+    monkeypatch.setattr(adapter_mod.os, "fsync", record_fsync)
+    a = _adapter(_Robot(fail=0))
+    a._edge_latch_file, a._edge_latched = str(latch), "edge-1"
+    a._persist_edge_latch()
+    monkeypatch.undo()
+    assert latch.exists()
+    assert synced == [str(tmp_path / "a" / "b"), str(tmp_path / "a"), str(tmp_path)], synced
+
+
+def test_an_edge_estop_during_shutdown_is_written_before_the_exit(tmp_path):
+    """The latch set while shutdown looks for rest, after its steps were listed, is written by
+    its last step."""
+    latch = tmp_path / "edge-latch"
+    a = _adapter(_Robot(fail=0))
+    a._edge_latch_file = str(latch)
+    look = a._report_rest_at_shutdown
+
+    def estop_while_looking(since):
+        a._edge_latched = "edge-9"                   # set, and no writer has run yet
+        look(since)
+    a._report_rest_at_shutdown = estop_while_looking
+    a.shutdown()
+    assert latch.exists() and "edge estop edge-9" in latch.read_text()

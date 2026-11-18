@@ -1525,6 +1525,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         steps.append(("looking for rest", lambda: self._report_rest_at_shutdown(since[0])))
         if segment:
             steps.append(("ending the processes the segment launched", self._stack.end_segment))
+        # Last: an edge estop during the steps above (looking for rest takes up to the stop
+        # budget) sets the latch after the step list was made; its file is written here, before
+        # the adapter exits. Written once: a no-op if it is written already, or nothing latched.
+        steps.append(("writing the edge estop's latch to disk", self._persist_edge_latch))
         print("shutdown: stopping the robot before the adapter exits", file=sys.stderr)
         for what, step in steps:
             try:
@@ -2560,10 +2564,16 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
     def _write_edge_latch(self, path: str, estop_id: str) -> None:
         """`_persist_edge_latch`'s write, under its lock. The file is synced, renamed into place,
-        and then its directory is synced, so a power loss right after the edge stop cannot drop
-        the rename and let a reboot start the adapter as if no latch were set."""
+        and then its directory is synced, and the parent of every directory this write created,
+        so a power loss right after the edge stop cannot drop the rename or a new directory and
+        let a reboot start the adapter as if no latch were set."""
         try:
             where = os.path.dirname(path) or "."
+            created = []                      # the directories this write makes, deepest first
+            d = os.path.abspath(where)
+            while not os.path.isdir(d) and os.path.dirname(d) != d:
+                created.append(d)
+                d = os.path.dirname(d)
             os.makedirs(where, exist_ok=True)
             tmp = f"{path}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -2572,11 +2582,12 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
-            directory = os.open(where, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            for synced in [where] + [os.path.dirname(c) for c in created]:
+                directory = os.open(synced, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
             self._edge_latch_written = True
         except Exception as exc:  # noqa: BLE001 - the latch still holds in this process
             with contextlib.suppress(Exception):
