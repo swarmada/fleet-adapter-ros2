@@ -234,3 +234,41 @@ def test_an_edge_estop_during_shutdown_is_written_before_the_exit(tmp_path):
     a._report_rest_at_shutdown = estop_while_looking
     a.shutdown()
     assert latch.exists() and "edge estop edge-9" in latch.read_text()
+
+
+def test_a_retried_write_syncs_the_directories_a_failed_write_created(monkeypatch, tmp_path):
+    """A first write that creates the latch's directories and then fails leaves them existing;
+    the retry (the estop's thread, or shutdown) must still sync each new entry in its parent, or
+    a power loss can drop them with the file, and the reboot starts unlatched."""
+    latch = tmp_path / "a" / "b" / "edge-latch"
+    synced: list = []
+    real_open, real_fsync, real_replace = adapter_mod.os.open, adapter_mod.os.fsync, adapter_mod.os.replace
+    opened: dict = {}
+    fail = [True]
+
+    def record_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        opened[fd] = str(path)
+        return fd
+
+    def record_fsync(fd):
+        if fd in opened:
+            synced.append(opened[fd])
+        return real_fsync(fd)
+
+    def replace_once_failing(src, dst):
+        if fail[0]:
+            fail[0] = False
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+    monkeypatch.setattr(adapter_mod.os, "open", record_open)
+    monkeypatch.setattr(adapter_mod.os, "fsync", record_fsync)
+    monkeypatch.setattr(adapter_mod.os, "replace", replace_once_failing)
+    a = _adapter(_Robot(fail=0))
+    a._edge_latch_file, a._edge_latched = str(latch), "edge-1"
+    a._persist_edge_latch()                          # makes a/ and a/b/, then fails
+    assert not latch.exists() and (tmp_path / "a" / "b").is_dir() and synced == []
+    a._persist_edge_latch()                          # the retry
+    monkeypatch.undo()
+    assert latch.exists()
+    assert synced == [str(tmp_path / "a" / "b"), str(tmp_path / "a"), str(tmp_path)], synced
