@@ -339,7 +339,7 @@ def _main(monkeypatch, capsys, *argv: str):
     monkeypatch.setattr(sys, "argv", ["adapter", *argv])
     monkeypatch.setattr(adapter_mod, "fleet_adapter_ros2Adapter", _adapter)
     monkeypatch.setattr(adapter_mod.grpc, "insecure_channel",
-                        lambda *_: pytest.fail("the adapter connected"))
+                        lambda *_, **__: pytest.fail("the adapter connected"))
     code = None
     try:
         adapter_mod.main()

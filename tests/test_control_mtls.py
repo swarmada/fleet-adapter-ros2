@@ -171,10 +171,35 @@ def test_an_unreadable_key_is_refused_naming_the_flag_not_a_value(
 
 def test_without_tls_flags_the_channel_is_plaintext_as_the_harness_serves() -> None:
     made = []
-    fake = NS(insecure_channel=lambda ep: made.append(("insecure", ep)) or "ch",
+    fake = NS(insecure_channel=lambda ep, options=(): made.append(("insecure", ep)) or "ch",
               secure_channel=lambda *a, **k: pytest.fail("secure without flags"))
     assert adapter_mod.open_control_channel(_args("localhost:9"), grpc_mod=fake) == "ch"
     assert made == [("insecure", "localhost:9")]
+
+
+def _keepalive(options) -> dict:
+    opts = dict(options)
+    assert 300_000 < opts.get("grpc.keepalive_time_ms", 0) <= 330_000, opts
+    assert 0 < opts.get("grpc.keepalive_timeout_ms", 0) <= 30_000, opts
+    assert opts.get("grpc.keepalive_permit_without_calls") == 1, opts
+    assert opts.get("grpc.http2.max_pings_without_data") == 0, opts
+    return opts
+
+
+def test_the_control_channel_pings_so_a_silently_dead_safety_stream_ends(pki) -> None:
+    """The SafetyStream shares the control channel, and nothing periodic comes on it: without
+    keepalive a path lost silently left the estop path counted up for as long as TCP took to
+    give up. Both channel types ping, at the interval the control plane's server accepts."""
+    made = []
+    fake = NS(insecure_channel=lambda ep, options=(): made.append(options) or "ch",
+              secure_channel=lambda ep, creds, options=(): made.append(options) or "ch",
+              ssl_channel_credentials=lambda **k: "creds")
+    adapter_mod.open_control_channel(_args("localhost:9"), grpc_mod=fake)
+    adapter_mod.open_control_channel(_args("localhost:9", pki), grpc_mod=fake)
+    assert len(made) == 2
+    _keepalive(made[0])
+    secure = _keepalive(made[1])
+    assert secure.get("grpc.ssl_target_name_override") == SERVER_NAME, secure
 
 
 def test_the_endpoint_is_never_printed(monkeypatch, capsys, pki) -> None:

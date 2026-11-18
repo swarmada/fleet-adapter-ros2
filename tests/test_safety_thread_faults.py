@@ -3,7 +3,8 @@
 
 """A fault on the safety path never ends a safety thread in silence.
 
-The stop paths turn the transport's RuntimeError into a FAILED that says why. Anything else -- a
+The stop paths turn the transport's RuntimeError, raised by a look at the robot after the stop,
+into a FAILED that says why; one raised by the stop itself is a fault like any other. Anything else -- a
 bug in the robot binding or in the adapter -- is not swallowed where it happens
 (`test_the_wrapper_does_not_swallow_a_bug_in_the_safety_primitive`), and it used to end the thread
 it reached:
@@ -595,8 +596,7 @@ def test_a_fault_in_an_edge_estop_answers_it_failed_and_the_next_edge_estop_is_s
     a = _adapter()
     edge = _EdgeTwoEstops()
     a._pb_grpc = NS(EdgeServiceStub=lambda channel: edge)
-    a._edge_addr.put("localhost:1")
-    a._edge_loop()                                   # returns when the edge stream ends
+    a._edge_stream("localhost:1")                    # returns when the edge stream ends
     acks = edge.acks(want=2)
     assert set(acks) == {"edge-1", "edge-2"}, f"answered: {sorted(acks)}"
     assert all(ack.state == pb.ESTOP_STATE_FAILED for ack in acks.values())
@@ -620,6 +620,92 @@ def test_a_fault_in_the_safety_stream_lost_report_still_reports_the_action_faile
             assert a._safety_faults == 1
             return
     raise AssertionError("the lost action's FAILED status was never sent")
+
+
+class _RaisingStderr:
+    """A stderr whose reader is gone: every write raises."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    def write(self, text: str) -> int:
+        raise self.exc
+
+    def flush(self) -> None:
+        raise self.exc
+
+
+class _CountsStops(SimulatedRobot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stops = 0
+
+    def command_stop(self, robot_id) -> None:
+        self.stops += 1
+        super().command_stop(robot_id)
+
+
+@pytest.mark.parametrize("exc", [BrokenPipeError(32, "Broken pipe"), OSError(5, "I/O error")])
+def test_a_stderr_that_raises_never_keeps_a_lost_stream_from_stopping_the_robot(monkeypatch,
+                                                                                  exc):
+    robot = _CountsStops()
+    robot.spawn(ROBOT)
+    a = Adapter(pb, None, robot, ROBOT)
+    a._safety_required = True
+    a._current_action, a._current_fencing_token = "t-1", 1
+    a._safety_up.set()
+    with monkeypatch.context() as m:
+        m.setattr(adapter_mod.sys, "stderr", _RaisingStderr(exc))
+        a._safety_down_guarded("test: the stream ended", 10.0)
+    assert robot.stops == 1, "the robot was not stopped: the log line came first"
+    assert a._current_action == "" and not a._safety_up.is_set()
+
+
+class _StopRaisesRuntimeError(SimulatedRobot):
+    """A binding whose stop raises the transport's own exception type, RuntimeError (a publish
+    on a dead rclpy context), every time."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stops = 0
+
+    def command_stop(self, robot_id: str) -> None:
+        self.stops += 1
+        raise RuntimeError("publish on a context that is not valid")
+
+
+def test_a_safety_stream_estop_whose_stop_raises_runtime_error_is_retried_and_refuses_motion(
+        monkeypatch):
+    """A RuntimeError from the stop is not the transport failing to confirm rest: the stop may
+    not have gone out. It used to be answered FAILED and nothing more: the stream stayed up,
+    assignments were accepted, and the stop was never tried again."""
+    _fast_retries(monkeypatch)
+    robot = _StopRaisesRuntimeError()
+    robot.spawn(ROBOT)
+    a = Adapter(pb, None, robot, ROBOT)
+    a._safety_required = True
+    cp = _EstopEveryStream()
+    t = threading.Thread(target=a.run_safety_stream, args=(cp,), daemon=True)
+    t.start()
+    try:
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end and not [x for n, x in cp.acks if n == 1]:
+            time.sleep(0.01)
+        first = [x for n, x in cp.acks if n == 1]
+        assert first and first[-1].state == pb.ESTOP_STATE_FAILED, "the estop got no FAILED"
+        assert "RuntimeError" in first[-1].message, first[-1].message
+        time.sleep(0.1)
+        refused = a._no_estop_path()
+        assert refused, "motion is not refused after a stop that raised"
+        n = robot.stops
+        end = time.monotonic() + 1.0
+        while time.monotonic() < end and robot.stops <= n + 2:
+            time.sleep(0.01)
+        assert robot.stops > n + 2, "the stop is not commanded again"
+    finally:
+        a._shutdown.set()
+        cp.release()
+    t.join(timeout=5.0)
 
 
 def test_a_fault_in_the_estop_drill_answers_it_failed_and_telemetry_goes_on():

@@ -157,9 +157,39 @@ type, same frame — and the difference shows only when the drive disobeys, whic
 moment a stop report matters. So there is no default and no detection: it is declared, and it
 is safe only if declared honestly.
 
+### The edge estop latch
+
+An estop from an edge node (the EdgeStream) sets the robot's local latch. From then on the
+adapter refuses every assignment and resume (`ROBOT_UNAVAILABLE`), and it writes the latch to a
+file on the robot's own disk, `--edge-latch-file`, by default
+`~/.local/state/swarmada/edge-latch-<robot-id>`. While that file is there the adapter does not
+start: it exits with `REFUSED:` and the file's path. A latch file that cannot be checked counts
+as set.
+
+**Clearing it is a step at the robot, by a person.** Once the robot has been confirmed safe at
+the robot, remove the file on the robot, then start the adapter:
+
+```sh
+rm ~/.local/state/swarmada/edge-latch-<robot-id>
+```
+
+The adapter offers no way to clear it over the network, and no message from the control plane
+or the edge node clears it. Run under a container, mount the file's directory from the robot's
+disk, or the latch goes with the container. A conformance run ends with the harness's edge
+estop (C8.3), so a run without its own `--edge-latch-file` leaves the default file set: remove
+it before the next run.
+
 Conformance is run with the published Swarmada harness (`make conformance` in the
-core tree, pointed at this adapter). Results are tracked in the Swarmada
-`adapters/REGISTRY.md`.
+core tree, pointed at this adapter). Give each run a latch file of its own, in a temporary
+directory, so a run never sets the latch at the default path on a robot:
+
+```sh
+python -m adapters.conformance --stub-path proto --adapter-name fleet-adapter-ros2 \
+  --adapter-cmd "fleet-adapter-ros2 --endpoint localhost:{port} --binding simulated \
+    --edge-latch-file $(mktemp -d)/edge-latch"
+```
+
+Results are tracked in the Swarmada `adapters/REGISTRY.md`.
 
 ## Map view
 
