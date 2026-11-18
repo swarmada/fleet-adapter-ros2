@@ -1215,6 +1215,13 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 resumed=False, message="a manual-drive is not resumed: the pause ended it; "
                                        "assign a new one"))
             return
+        if isinstance(job, explore.ChargeJob):
+            # A Charge sends no goal, so the binding's retained target is an earlier action's (a
+            # Navigate's, or a segment's return): re-dispatched, it drove the robot off the
+            # charger. A pause of a Charge held the base; there is nothing of its own to resume.
+            result.resume.CopyFrom(pb.ResumeResult(
+                resumed=True, message="Charge: nothing re-dispatched; a Charge never moves"))
+            return
         # Under the lease lock, checked again first, for the reason `_refused_under_lease_lock`
         # gives. Nothing here waits (command_resume never does; a segment's resume sets a flag).
         with self._lease_lock:
@@ -1423,6 +1430,18 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             self._halt_job()
             with self._robot_lock:
                 self._motion_epoch += 1     # the job moves the robot from here on
+                if isinstance(job, explore._Job):
+                    # A segment or a Charge sends no goal as it starts, so nothing else would end
+                    # what still drives: a superseded Navigate's goal, a segment's return, or its
+                    # explorer's goal accepted late. Held as a stop holds it; a segment releases
+                    # the hold for its own explorer. Never waits. A hold that raises is reported
+                    # and the job still starts: before this hold there was none.
+                    hold = getattr(self._robot, "command_hold", None) or self._robot.command_stop
+                    try:
+                        hold(self._robot_id)
+                    except Exception as exc:  # noqa: BLE001 - a stop path: the job still starts
+                        print(f"{task.action_id}: holding the base as it starts raised "
+                              f"{type(exc).__name__}: {exc}", file=sys.stderr)
             if isinstance(job, explore._Job):
                 job.arm()   # before it is current: a stop from now on marks this job
             self._job = job

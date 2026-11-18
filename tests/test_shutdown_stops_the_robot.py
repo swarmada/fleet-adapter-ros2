@@ -401,6 +401,7 @@ def test_on_the_nav2_binding_shutdown_holds_cancels_stops_the_explorer_and_ends_
     monkeypatch.setattr(explore.ExploreJob, "_run", segment)
     handle = _LogHandle(log)
     stub = _patch_transport(monkeypatch)
+    signalled = [0]     # the log's length at the SIGTERM: the segment's start holds the base too
 
     def drive():
         assert stub.opened.wait(5.0), "the robot was never registered"
@@ -411,6 +412,7 @@ def test_on_the_nav2_binding_shutdown_holds_cancels_stops_the_explorer_and_ends_
         _until(lambda: server.futures, "the return goal to reach the server")
         server.futures[0].cb(NS(result=lambda: handle))
         _until(lambda: b._goal_handle is handle, "the return goal to be adopted")
+        signalled[0] = len(log)
         os.kill(os.getpid(), signal.SIGTERM)
     t = threading.Thread(target=drive, daemon=True)
     t.start()
@@ -422,8 +424,10 @@ def test_on_the_nav2_binding_shutdown_holds_cancels_stops_the_explorer_and_ends_
     assert "teardown" in log, log
     assert b._holding, "the base was never held"
     assert handle.cancels == 1, "the return goal was not cancelled"
-    order = [_first(log, "hold"), _first(log, "cancel"), _first(log, "zero_twist"),
-             _first(log, "explore/resume=False"), _first(log, "kill"), log.index("teardown")]
+    shutdown = log[signalled[0]:]
+    order = [_first(shutdown, "hold"), _first(shutdown, "cancel"), _first(shutdown, "zero_twist"),
+             _first(shutdown, "explore/resume=False"), _first(shutdown, "kill"),
+             shutdown.index("teardown")]
     assert order == sorted(order), log
     kill = next(s for s, *_ in shell.runs if "kill -INT" in s)
     for name in ("lib/explore_lite/explore", "async_slam_toolbox_node", "keepout_servers"):
