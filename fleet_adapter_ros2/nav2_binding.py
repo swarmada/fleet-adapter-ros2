@@ -174,6 +174,9 @@ class Nav2Binding:
         self._scan_rest = (None if rest_scan_topic is None
                            else scan_rest.RestChannel(rest_scan_threshold_m))
         self._handover_hold_at: float | None = None
+        # The odom count (`state_seq`) when that hold was commanded: the handover's rest is
+        # judged only on odometry received after it, as every stop's confirmation is.
+        self._handover_hold_seq: int | None = None
         if ready_topic is not None:
             if rest_scan_topic is None:
                 raise ValueError("ready_topic needs rest_scan_topic: the operator confirms rest, "
@@ -945,6 +948,7 @@ class Nav2Binding:
             handle = self._halt_locked(close_gate=False)
             self._publish_twist_locked(manual_drive.ZERO)
             self._handover_hold_at = self._now()
+            self._handover_hold_seq = self._odom_count
             if self._ready is not None:
                 self._ready.arm(action_id, self._handover_hold_at)
         if self._node is not None:  # pragma: no cover — requires the ROS 2 runtime
@@ -983,16 +987,26 @@ class Nav2Binding:
         return self.rest_evidence_gap(robot_id)
 
     def handover_at_rest(self, robot_id: str) -> tuple[bool, str]:
-        """(at rest for the handover, why not). Without a scan channel: `is_stopped`."""
+        """(at rest for the handover, why not), judged only once odometry has been received
+        after the hold (`hold_for_handover`). Without a scan channel: `is_stopped`'s rule."""
         with self._lock:
             return self._handover_at_rest_locked()
 
     def _handover_at_rest_locked(self) -> tuple[bool, str]:
+        # Only odometry received after the hold may show rest or veto it: a reading from
+        # before the hold is from a base that may still have been driving.
+        if self._handover_hold_seq is None:
+            return False, "no hold was commanded for the handover"
+        if self._odom_count <= self._handover_hold_seq:
+            return False, "no odometry received since the hold"
         if self._scan_rest is None:
             return (True, "") if self._at_rest_locked() else (False, "")
         # Refute wins: whatever the scan says, these veto it.
         if self._stop_pending:
             return False, "a goal sent before the hold is still unanswered and may drive"
+        if self._server_running_locked():
+            return False, ("the navigation server still runs a goal, which can drive the "
+                           "robot whatever the scan shows")
         if self._spin_fault is not None:
             return False, "the ROS 2 executor has stopped, so no scan is current"
         if self._speed is not None and (self._speed[0] > _EPS_LINEAR
@@ -1014,7 +1028,8 @@ class Nav2Binding:
         """Nav2 declined a navigate-handover's goal: turn the armed gate to the operator, or refuse
         (`TeleopGate.hand_over`). Under ``_lock``, so a stop that closed the gate -- every stop
         does, in `_halt_locked` -- wins, and so does a lease deadline that has passed. Refused
-        too unless the robot is confirmed at rest under that same lock: with a scan channel,
+        too unless the robot is confirmed at rest under that same lock, on odometry received
+        after the hold (`_handover_at_rest_locked`): with a scan channel,
         the scan shows rest in a window after the hold and nothing vetoes it; without one,
         odometry declared measured and its twist within noise (`_at_rest_locked`). On
         command-derived or undeclared odometry and no scan channel that never holds, so this

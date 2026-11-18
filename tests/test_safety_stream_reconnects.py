@@ -224,7 +224,12 @@ def test_while_the_safety_stream_is_down_the_robot_is_held_and_motion_is_refused
         time.sleep(0.8)
         net.send(3, assign_action=_navigate("nav-3", 3))
         _until(lambda: robot._moving.get(ROBOT), "nav-3 to run once the SafetyStream is back")
-        assert net.results("assign_action")[-1].assign_action.accepted
+        # nav-3's own answer: the robot moves before it is written, so the last answer read
+        # straight away can still be nav-2's refusal.
+        _until(lambda: any(r.command_id == 3 for r in net.results("assign_action")),
+               "an answer to nav-3")
+        nav3 = next(r for r in net.results("assign_action") if r.command_id == 3)
+        assert nav3.assign_action.accepted, nav3
     _run(monkeypatch, drive)
 
 

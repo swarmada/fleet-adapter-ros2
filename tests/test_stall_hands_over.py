@@ -22,6 +22,7 @@ dispatch, the goal handle's cancel and every /cmd_vel Twist are recorded.
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 from conftest import mark_transport_live
@@ -113,8 +114,16 @@ def test_a_stall_opens_the_operators_turn_and_says_stalled() -> None:
     a, b, c, sent, where = rig()
     msgs = assign(a)
     stall(b, c, sent)
-    b.on_odom(_odom(0.0))                                 # measured odometry: at rest
-    collect(a, msgs, lambda ms: turned(ms) or terminals(ms, ACTION))
+    stop = threading.Event()
+
+    def odom() -> None:                                   # measured odometry, streaming: at rest
+        while not stop.wait(0.001):
+            b.on_odom(_odom(0.0))
+    threading.Thread(target=odom, daemon=True).start()
+    try:
+        collect(a, msgs, lambda ms: turned(ms) or terminals(ms, ACTION))
+    finally:
+        stop.set()
     said = texts(msgs)
     assert not terminals(msgs, ACTION), said
     assert turned(msgs), said

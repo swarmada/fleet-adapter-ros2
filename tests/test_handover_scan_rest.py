@@ -255,6 +255,7 @@ def test_nav2_with_the_scan_hands_over_on_command_derived_odometry_only_at_rest(
     b.on_odom(_odom(0.0))
     assert b.handover_rest_gap(ROBOT) == ""
     assert b.hold_for_handover(ROBOT, ACTION)
+    b.on_odom(_odom(0.0))  # the first odometry after the hold
     plant, lidar = Plant(true=DRIFT), Lidar(seed=81)
     _scans_for(b, clock, plant, lidar, 2.0)                    # held, and still drifting
     assert not b.hand_over_teleop(ROBOT, ACTION, 5.0, WHY)
@@ -270,9 +271,10 @@ def test_nav2_with_the_scan_hands_over_on_command_derived_odometry_only_at_rest(
 
 def test_nav2_with_the_scan_measured_odometry_at_rest_does_not_override_a_moving_scan(T) -> None:  # noqa: F811
     b, _, drive, clock = _armed_nav2_scan(T, source="measured")
-    b.on_odom(_odom(0.0))                                       # odometry would confirm rest
     assert b.hold_for_handover(ROBOT, ACTION)
+    b.on_odom(_odom(0.0))                         # after the hold: odometry would confirm rest
     _scans_for(b, clock, Plant(true=DRIFT), Lidar(seed=82), 3.0)
+    assert "moving" in b.handover_at_rest(ROBOT)[1]
     assert not b.hand_over_teleop(ROBOT, ACTION, 5.0, WHY) and drive.phase != md.RUNNING
 
 
@@ -298,6 +300,8 @@ def test_nav2_with_the_scan_no_hold_no_scan_or_a_stale_scan_never_hands_over(T) 
     assert "hold" in b.handover_at_rest(ROBOT)[1]               # never commanded to hold
     with b._lock:
         b._handover_hold_at = clock.t - 5.0
+        b._handover_hold_seq = b._odom_count   # as `hold_for_handover` records both
+    b.on_odom(_odom(0.0))  # the first odometry after the hold
     assert b.handover_at_rest(ROBOT) == (True, "")
     clock.t += 0.4                                              # the lidar went quiet
     ok, why = b.handover_at_rest(ROBOT)
@@ -333,6 +337,8 @@ def test_with_the_scan_on_and_showing_rest_an_estop_is_still_failed_on_command_d
     b.on_odom(_odom(0.0))
     with b._lock:
         b._handover_hold_at = time.monotonic() - 10.0
+        b._handover_hold_seq = b._odom_count   # as `hold_for_handover` records both
+    b.on_odom(_odom(0.0))  # the first odometry after the hold
     stop = threading.Event()
     lidar, plant = Lidar(seed=86), Plant()
 
@@ -348,7 +354,11 @@ def test_with_the_scan_on_and_showing_rest_an_estop_is_still_failed_on_command_d
     control.start()
     try:
         assert cp.opened.wait(2.0)
-        time.sleep(sr.LAG_S + sr.WINDOW_S + 0.3)
+        # The scan's full look, on the feeder's own scans: waited for, not slept, so a feeder
+        # that lags on a loaded runner delays the test instead of failing it.
+        end = time.monotonic() + sr.LAG_S + sr.WINDOW_S + 10.0
+        while time.monotonic() < end and b.handover_at_rest(ROBOT) != (True, ""):
+            time.sleep(0.02)
         assert b.handover_at_rest(ROBOT) == (True, "")          # the scan shows rest
         _driving(a, b, server, cp)
         safety = threading.Thread(target=a.run_safety_stream, args=(_SafetyStub(),),
