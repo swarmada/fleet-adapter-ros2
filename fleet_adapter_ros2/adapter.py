@@ -477,6 +477,9 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # comes first; this lock is held only for that write.
         self._edge_latch_write_lock = threading.Lock()
         self._edge_latch_written = False
+        # Every directory a latch write has created, deepest first, kept across attempts: a write
+        # that created them and then failed leaves them existing, and the retry syncs them too.
+        self._edge_latch_dirs: list[str] = []
         # Commands that may set the robot moving again: a resume and every accepted assignment
         # raise it, under `_robot_lock`. A pause waiting for confirmed rest reads it under the
         # same lock before it says paused=true (`_on_pause`), so a pause the robot has already
@@ -2595,9 +2598,10 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
 
     def _write_edge_latch(self, path: str, estop_id: str) -> None:
         """`_persist_edge_latch`'s write, under its lock. The file is synced, renamed into place,
-        and then its directory is synced, and the parent of every directory this write created,
-        so a power loss right after the edge stop cannot drop the rename or a new directory and
-        let a reboot start the adapter as if no latch were set."""
+        and then its directory is synced, and the parent of every directory a write created, this
+        one or an earlier one that failed after creating them, so a power loss right after the
+        edge stop cannot drop the rename or a new directory and let a reboot start the adapter as
+        if no latch were set."""
         try:
             where = os.path.dirname(path) or "."
             created = []                      # the directories this write makes, deepest first
@@ -2605,6 +2609,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             while not os.path.isdir(d) and os.path.dirname(d) != d:
                 created.append(d)
                 d = os.path.dirname(d)
+            # Kept before they are made, so a write that fails after making them leaves them here.
+            self._edge_latch_dirs[:0] = [c for c in created if c not in self._edge_latch_dirs]
             os.makedirs(where, exist_ok=True)
             tmp = f"{path}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -2613,7 +2619,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
-            for synced in [where] + [os.path.dirname(c) for c in created]:
+            for synced in [where] + [os.path.dirname(c) for c in self._edge_latch_dirs]:
                 directory = os.open(synced, os.O_RDONLY)
                 try:
                     os.fsync(directory)
