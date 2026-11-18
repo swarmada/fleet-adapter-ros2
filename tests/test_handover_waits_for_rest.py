@@ -267,6 +267,7 @@ def _armed_nav2(odometry_source):
         b._goal = task_map.GoalPose(x=2.0, y=1.0, yaw=0.0)
         b._holding, b._goal_status = False, 0
     decline(b)
+    assert b.hold_for_handover(ROBOT, ACTION)   # as the job holds the base before it asks
     return b, pub, drive
 
 
