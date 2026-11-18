@@ -1215,6 +1215,13 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                 resumed=False, message="a manual-drive is not resumed: the pause ended it; "
                                        "assign a new one"))
             return
+        if isinstance(job, explore.ChargeJob):
+            # A Charge sends no goal, so the binding's retained target is an earlier action's (a
+            # Navigate's, or a segment's return): re-dispatched, it drove the robot off the
+            # charger. A pause of a Charge held the base; there is nothing of its own to resume.
+            result.resume.CopyFrom(pb.ResumeResult(
+                resumed=True, message="Charge: nothing re-dispatched; a Charge never moves"))
+            return
         # Under the lease lock, checked again first, for the reason `_refused_under_lease_lock`
         # gives. Nothing here waits (command_resume never does; a segment's resume sets a flag).
         with self._lease_lock:
