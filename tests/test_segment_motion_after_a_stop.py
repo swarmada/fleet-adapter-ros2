@@ -468,9 +468,10 @@ def test_a_goal_sent_just_after_a_stop_is_never_cancelled_by_it():
         record(goal_id)
     b._cancel_running_goal = cancel
     b.command_hold(ROBOT)
-    ours = b"\x09" * 16
+    ours = b._claimed[b._goal_epoch]                         # the id the new goal was sent with
     b.on_nav_status([(EXPLORERS, 3), (ours, 2)])            # the new goal runs: not held now
-    assert b.cancelled == [EXPLORERS], "a goal sent after the stop was cancelled"
+    assert ours not in b.cancelled, "a goal sent after the stop was cancelled"
+    assert set(b.cancelled) == {EXPLORERS}    # by the stop, and by the new goal's own guard
     assert len(b.sent) == 1 and b.pending_goal(ROBOT) is not None
 
 

@@ -157,6 +157,18 @@ type, same frame — and the difference shows only when the drive disobeys, whic
 moment a stop report matters. So there is no default and no detection: it is declared, and it
 is safe only if declared honestly.
 
+### Other senders' goals are cancelled while the adapter drives
+
+With the ros2 binding, **while the adapter's own navigation goal runs, it cancels every other
+goal on the navigation server, an operator's included.** From the moment it sends its goal (an
+assignment's, a return to an explore segment's mark, a resume) until that goal succeeds, the
+segment's explorer is started, or the robot is stopped, any goal the Nav2 server lists as running
+that this adapter did not send is cancelled by its id. If the adapter's goal fails or is
+cancelled, this goes on until its next goal or explorer start, or a stop: the server ends the
+adapter's goal when a later goal preempts it. To drive the robot by hand while it is managed,
+use a manual-drive or navigate-handover assignment, not a goal of your own. While the robot is
+idle, after a goal that succeeded, other goals are left alone.
+
 ### The edge estop latch
 
 An estop from an edge node (the EdgeStream) sets the robot's local latch. From then on the
