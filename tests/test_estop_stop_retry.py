@@ -25,6 +25,7 @@ from fleet_adapter_ros2.robot import SimulatedRobot
 
 ROBOT = "amr-1"
 FAILING = "the robot's stop is failing"
+LATCHED = "set this robot's local latch"
 
 
 class _Robot(SimulatedRobot):
@@ -172,15 +173,20 @@ def test_the_action_an_edge_estop_stopped_is_not_new_work_that_ends_the_refusal(
         a._shutdown.set()
 
 
-def test_an_edge_estop_whose_stop_goes_out_on_a_retry_lifts_the_refusal(monkeypatch, capsys):
+def test_an_edge_estop_whose_stop_goes_out_on_a_retry_lifts_the_retrys_refusal(monkeypatch,
+                                                                               capsys):
+    """The retry's refusal ends; the edge estop's local latch still refuses."""
     _fast_retries(monkeypatch)
     robot = _Robot(fail=3)                           # the estop's own stop and two retries raise
     a = _adapter(robot)
     try:
         edge = _edge_estop(a, "edge-1")
         assert edge.acks(1)["edge-1"].state == pb.ESTOP_STATE_FAILED
-        assert _until(lambda: a._no_estop_path() == ""), a._no_estop_path()
-        assert robot.stops == 4
+        assert _until(lambda: FAILING not in a._no_estop_path()), a._no_estop_path()
+        assert LATCHED in a._no_estop_path()
+        # Three raised; then one went out. The stop after the latch is one of the four, or a
+        # fifth if it went out while the retry was still to send its own.
+        assert robot.stops in (4, 5), robot.stops
         assert _until(lambda: "once estop edge-1 raised" in capsys.readouterr().err)
     finally:
         a._shutdown.set()
@@ -188,14 +194,18 @@ def test_an_edge_estop_whose_stop_goes_out_on_a_retry_lifts_the_refusal(monkeypa
 
 def test_an_edge_estop_whose_confirmation_raises_commands_the_stop_again_once():
     """Whether the stop went out cannot be told from a fault: it is commanded again, and the
-    refusal ends as soon as one goes out."""
+    retry's refusal ends as soon as one goes out (the local latch's does not)."""
     robot = _ConfirmRaises(fail=0)
     a = _adapter(robot)
     try:
         edge = _edge_estop(a, "edge-1")
         assert edge.acks(1)["edge-1"].state == pb.ESTOP_STATE_FAILED
-        assert _until(lambda: a._no_estop_path() == ""), a._no_estop_path()
-        assert robot.stops == 2
+        assert _until(lambda: FAILING not in a._no_estop_path()), a._no_estop_path()
+        assert LATCHED in a._no_estop_path()
+        # The estop's, the retry's, and the stop after the latch.
+        assert _until(lambda: robot.stops == 3), robot.stops
+        time.sleep(0.05)
+        assert robot.stops == 3
     finally:
         a._shutdown.set()
 

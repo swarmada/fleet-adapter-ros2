@@ -125,6 +125,37 @@ _RETRY_ENDINGS = {
 }
 
 
+# Where an edge estop's local latch is kept, on the robot's own disk (`--edge-latch-file`).
+# `{robot_id}` is replaced by the robot's ID. The adapter does not start while the file is there
+# (`_edge_latch_refusal`); removing it on the robot is the latch's only reset.
+EDGE_LATCH_FILE_DEFAULT = "~/.local/state/swarmada/edge-latch-{robot_id}"
+
+
+def _edge_latch_path(spec: str, robot_id: str) -> str:
+    """The latch file `--edge-latch-file` names for this robot."""
+    return os.path.expanduser(spec.replace("{robot_id}", robot_id.replace("/", "_")))
+
+
+def _edge_latch_refusal(path: str) -> str:
+    """Why the adapter must not start, or "": an edge estop set the robot's local latch, kept at
+    `path`, or whether it did cannot be told, which RFC-0001 treats as set."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return (f"the edge estop latch file {path} cannot be checked ({type(exc).__name__}: "
+                f"{exc}), so the latch is treated as set; fix the path or its permissions on the "
+                f"robot, or name another with --edge-latch-file")
+    held = ""
+    with contextlib.suppress(Exception), open(path, encoding="utf-8") as fh:
+        held = fh.read(512).strip()
+    return (f"an edge estop set this robot's local latch ({held or 'the file cannot be read'}), "
+            f"and the adapter does not start while it is set. Confirm the robot safe at the "
+            f"robot, then clear the latch there, on the robot's own disk: rm {path}. The adapter "
+            f"offers no way to clear it over the network")
+
+
 def _n(count: int, noun: str) -> str:
     """'1 attempt', '3 attempts'."""
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
@@ -379,7 +410,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
                  keepouts_ref: str | None = None,
                  provisioning_interval_s: float | None = None, mapview=None,
                  handover_rest_s: float = _ESTOP_TICK_S * _ESTOP_TICKS,
-                 handover_ready_s: float = handover.READY_S) -> None:
+                 handover_ready_s: float = handover.READY_S,
+                 edge_latch_file: str | None = None) -> None:
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
@@ -404,6 +436,16 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         # under `_lease_lock`.
         self._stop_failing = ""
         self._stop_retry_gen = 0
+        # The edge estop that set the robot's local latch, or "": from then on every assignment
+        # and resume is refused (`_no_estop_path`, `_set_edge_latch`). It is also written to
+        # `_edge_latch_file` (None: kept in this process only), and `main` does not start while
+        # that file is there.
+        self._edge_latched = ""
+        self._edge_latch_file = edge_latch_file
+        # The latch file is written once (`_persist_edge_latch`), from whichever of its writers
+        # comes first; this lock is held only for that write.
+        self._edge_latch_write_lock = threading.Lock()
+        self._edge_latch_written = False
         # Commands that may set the robot moving again: a resume and every accepted assignment
         # raise it, under `_robot_lock`. A pause waiting for confirmed rest reads it under the
         # same lock before it says paused=true (`_on_pause`), so a pause the robot has already
@@ -728,8 +770,9 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         threading.Thread(target=wait, daemon=True, name="register-when-safe").start()
 
     def _no_estop_path(self) -> str:
-        """Why no motion may be dispatched now, or "": none while the SafetyStream is down, and
-        none while a stop that raised when it was lost is still being tried again."""
+        """Why no motion may be dispatched now, or "": none while the SafetyStream is down, none
+        while a stop that raised when it was lost is still being tried again, and none once an
+        edge estop has set the local latch."""
         if self._safety_required and not self._safety_up.is_set():
             return ("the SafetyStream is down: no estop can reach this robot, so it does not "
                     "move until the stream is back")
@@ -738,6 +781,14 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             return (f"the robot's stop is failing (the last attempt: {failing}): it is being "
                     f"commanded again, and no assignment or resume is accepted until a stop goes "
                     f"out")
+        latched = self._edge_latched
+        if latched:
+            where = self._edge_latch_file
+            return (f"edge estop {latched} set this robot's local latch: no assignment or resume "
+                    f"is accepted, and the adapter does not start again, until a person has "
+                    f"confirmed the robot safe at the robot and cleared the latch there"
+                    + (f" (rm {where} on the robot)" if where else
+                       " (this adapter was given no latch file: a restart lifts it)"))
         return ""
 
     def _provisioning_iteration(self, outbox) -> None:
@@ -1448,7 +1499,8 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         a segment runs; rest looked for, within the estop's budget; and
         the processes a running segment launched ended (SLAM, the keep-out servers, the
         explorer). The caller tears rclpy down after this: every step here needs it. Nothing
-        here waits on a lock another thread may hold."""
+        here waits on a lock another thread may hold, but for the edge latch file's, held only
+        for its one write."""
         self._shutdown.set()
         rid = self._robot_id
         hold = getattr(self._robot, "command_hold", None) or self._robot.command_stop
@@ -1465,6 +1517,9 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             # hold takes, so one sent after the hold is refused, not driven.
             steps.append(("ending the running job", job.halted.set))
         steps.append(("holding the base and cancelling the navigation goal", hold_and_count))
+        if self._edge_latched:
+            # An edge estop just before the exit: its latch file may not be written yet.
+            steps.append(("writing the edge estop's latch to disk", self._persist_edge_latch))
         if segment:
             steps.append(("stopping the explorer", self._stack.stop_explorer))
         steps.append(("looking for rest", lambda: self._report_rest_at_shutdown(since[0])))
@@ -2455,6 +2510,80 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
             if self._shutdown.wait(_REDIAL_S):
                 return
 
+    def _set_edge_latch(self, estop_id: str) -> bool:
+        """An edge estop sets the robot's local latch before its stop is commanded, whatever
+        comes of the stop, and nothing but a restart clears it (RFC-0001, safety, *Edge /
+        Headless Emergency Stop*: every adapter with an EdgeStream sets it, whatever contract
+        version). It is held in this process and written to the robot's own disk
+        (`_persist_edge_latch`); the adapter does not start while that file is there, and
+        removing it on the robot is the only reset. Set without a lock, so the estop's stop
+        never waits behind a dispatch (`_stop_after_edge_latch`). True when this estop set
+        it."""
+        if self._edge_latched:
+            return False
+        self._edge_latched = estop_id
+        return True
+
+    def _stop_after_edge_latch(self, estop_id: str) -> None:
+        """On its own thread, started as the latch is set. An assignment or resume that passed
+        `_no_estop_path` just before the latch was set may send its goal after the estop's stop,
+        which takes no adapter lock. Such a dispatch sends under `_lease_lock`, so once this
+        holds it every one has gone out, and the stop is commanded once more, without waiting
+        for the estop's confirmation, which a goal driving keeps unconfirmed for the whole stop
+        budget. A stop that raises here is tried again as the estop's own
+        (`_estop_stop_failed`). Never raises."""
+        try:
+            with self._lease_lock:
+                self._robot.command_stop(self._robot_id)
+        except Exception as exc:  # noqa: BLE001 - the estop's thread goes on
+            fault = _SafetyPathFault(_fault_text(exc))
+            fault.where = f"estop {estop_id}: the stop after the latch"
+            fault.__cause__ = exc
+            self._estop_stop_failed(estop_id, fault)
+            self._log_estop_fault(fault)
+
+    def _persist_edge_latch(self) -> None:
+        """Write the latch to the robot's own disk, so no restart of this adapter, however it
+        comes, lifts it: `main` refuses to start while the file is there (`_edge_latch_refusal`).
+        Written once, by the first of its writers: a thread of its own, started as the latch is
+        set; the estop's thread, once the estop is answered; and shutdown, before the adapter
+        exits. None of them waits on the lease lock. Written to a temporary file, synced, and
+        renamed into place. A write that fails is logged; the latch then holds in this process
+        only. Never raises."""
+        path, estop_id = self._edge_latch_file, self._edge_latched
+        if not path or not estop_id:
+            return
+        with self._edge_latch_write_lock:
+            if self._edge_latch_written:
+                return
+            self._write_edge_latch(path, estop_id)
+
+    def _write_edge_latch(self, path: str, estop_id: str) -> None:
+        """`_persist_edge_latch`'s write, under its lock. The file is synced, renamed into place,
+        and then its directory is synced, so a power loss right after the edge stop cannot drop
+        the rename and let a reboot start the adapter as if no latch were set."""
+        try:
+            where = os.path.dirname(path) or "."
+            os.makedirs(where, exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(f"robot {self._robot_id}: edge estop {estop_id} at "
+                         f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            directory = os.open(where, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            self._edge_latch_written = True
+        except Exception as exc:  # noqa: BLE001 - the latch still holds in this process
+            with contextlib.suppress(Exception):
+                print(f"EDGE_LATCH_NOT_PERSISTED robot={self._robot_id}: writing {path} raised "
+                      f"{type(exc).__name__}: {exc}; the latch holds in this process only, and a "
+                      f"restart would lift it", file=sys.stderr, flush=True)
+
     def _edge_stream(self, addr: str) -> None:
         """One EdgeStream to the edge node at `addr`, until it ends."""
         pb = self._pb
@@ -2479,15 +2608,38 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
         try:
             for ec in estub.EdgeStream(requests()):
                 if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
+                    estop_id = ec.estop.estop_id
+                    latched = self._set_edge_latch(estop_id)
+                    stop_later = latched
+                    if latched:
+                        with contextlib.suppress(Exception):   # if not, run after the estop
+                            threading.Thread(target=self._stop_after_edge_latch,
+                                             args=(estop_id,), daemon=True,
+                                             name="edge-latch-stop").start()
+                            stop_later = False
+                        with contextlib.suppress(Exception):   # if not, written below
+                            threading.Thread(target=self._persist_edge_latch, daemon=True,
+                                             name="edge-latch-write").start()
                     try:
-                        self._estop(ec.estop.estop_id,
+                        self._estop(estop_id,
                                     lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
                     except _SafetyPathFault as fault:
                         # Answered FAILED. The stop is commanded again and motion refused until
                         # it goes out, before anything is logged; then logged and counted here,
                         # and the EdgeStream goes on reading the next estop.
-                        self._estop_stop_failed(ec.estop.estop_id, fault)
+                        self._estop_stop_failed(estop_id, fault)
                         self._log_estop_fault(fault)
+                    if stop_later:
+                        self._stop_after_edge_latch(estop_id)
+                    if latched:   # said once the estop is answered: stderr can be slow
+                        self._persist_edge_latch()   # written already, unless its thread lags
+                        with contextlib.suppress(Exception):
+                            print(f"EDGE_LATCH robot={self._robot_id}: edge estop {estop_id} set "
+                                  f"the local latch; no assignment or resume is accepted, and "
+                                  f"the adapter does not start again, until it is cleared at the "
+                                  f"robot" + (f" (rm {self._edge_latch_file})"
+                                              if self._edge_latch_file else ""),
+                                  file=sys.stderr, flush=True)
         finally:
             outbox.put(None)
             with contextlib.suppress(Exception):
@@ -2844,6 +2996,11 @@ def main() -> None:
                          "this adapter's own copy")
     ap.add_argument("--store-bucket", default=None, metavar="NAME",
                     help="the bucket in --store-endpoint (default: the --artifact-store name)")
+    ap.add_argument("--edge-latch-file", default=EDGE_LATCH_FILE_DEFAULT, metavar="PATH",
+                    help="where an edge estop's local latch is kept, on the robot's own disk; "
+                         "{robot_id} is replaced by --robot-id. The adapter does not start while "
+                         "the file is there; removing it on the robot, once the robot is "
+                         "confirmed safe, is the latch's only reset")
     ap.add_argument("--battery-hard-mv", type=float, default=None, metavar="MV",
                     help="ros2 binding: the battery's hard stop. With --battery-full-mv and a "
                          "site file, the binding declares explore-floor and Charge; a robot "
@@ -2983,9 +3140,15 @@ def main() -> None:
     mapview = None
     if not refusal:
         mapview, refusal = _resolve_mapview(args)
+    edge_latch_file = _edge_latch_path(args.edge_latch_file, args.robot_id) or None
+    if not refusal and edge_latch_file:
+        refusal = _edge_latch_refusal(edge_latch_file)
     if refusal:
         print(f"REFUSED: {refusal}", file=sys.stderr)
         raise SystemExit(2)
+    if not edge_latch_file:
+        print("edge estop latch: NOT kept on disk (--edge-latch-file is empty): an edge estop's "
+              "latch holds only until this adapter exits, and a restart lifts it", file=sys.stderr)
     if args.binding == "ros2":
         print(f"goal response bound: a goal sent to the navigation server and unanswered after "
               f"{response_bound:g} s is abandoned -- the robot stopped, the goal cancelled by its "
@@ -3091,7 +3254,8 @@ def main() -> None:
         artifacts=explore.ArtifactDir(args.artifact_root, args.artifact_store, remote=remote),
         keepouts_ref=args.keepouts_ref, provisioning_interval_s=args.provisioning_interval,
         mapview=mapview, handover_rest_s=args.handover_rest_s,
-        handover_ready_s=ready[0] if ready else handover.READY_S)
+        handover_ready_s=ready[0] if ready else handover.READY_S,
+        edge_latch_file=edge_latch_file)
 
     channel = open_control_channel(args)
     # The endpoint itself is not printed: on a robot run it is an address on a site's own
