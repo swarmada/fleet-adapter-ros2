@@ -151,6 +151,19 @@ def rigs():
         r.close()
 
 
+def at_rest(r: _Rig, timeout_s: float = LOOK_S + 10.0) -> None:
+    """Wait until the binding's rest check passes: the veto's full look (LOOK_S) on the rig's
+    own scans, as an operator looks before pressing. A fixed sleep of the look's length lost the
+    race when the rig's scan thread lagged on a loaded runner: the press came before the look was
+    complete, was refused and spent, and the turn never opened."""
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        if r.b.handover_at_rest(ROBOT)[0]:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"the rig never showed rest: {r.b.handover_at_rest(ROBOT)[1]}")
+
+
 def waiting(msgs) -> list:
     return [s for s in statuses(msgs, ACTION)
             if s.state == pb.ACTION_STATE_RUNNING and "press ready" in s.message]
@@ -176,7 +189,7 @@ def test_a_ready_after_the_decline_opens_the_turn_and_the_leg_completes(T, rigs,
     time.sleep(DRIVE_S)                          # past the first lease, inside the renewed one
     r.decline(how, msgs)
     assert ("aborted" if how == "abort" else "stalled") in waiting(msgs)[0].message
-    time.sleep(LOOK_S + 0.3)                     # the veto's full look
+    at_rest(r)                                   # the veto's full look
     assert r.b.on_ready() == ""                  # kept for the held handover
     collect(r.a, msgs, turned)
     assert renewals(msgs) and all(renewals(msgs))
@@ -201,7 +214,7 @@ def test_a_ready_while_nav2_drives_is_ignored_and_one_after_the_decline_counts(
     assert "no declined handover is held" in r.b.on_ready()   # before the decline: not kept
     time.sleep(DRIVE_S / 2)
     r.decline(how, msgs)
-    time.sleep(LOOK_S + 0.3)
+    at_rest(r)
     assert not turned(msgs + drain(r.a))         # the early press was never queued
     assert r.b.on_ready() == ""
     collect(r.a, msgs, turned)
@@ -310,7 +323,7 @@ def test_the_bindings_ready_lines_are_stamped(T, rigs, how) -> None:  # noqa: F8
     r.b.on_ready()                               # while Nav2 drives
     time.sleep(DRIVE_S)
     r.decline(how, msgs)
-    time.sleep(LOOK_S + 0.3)
+    at_rest(r)
     r.b.on_ready()
     collect(r.a, msgs, turned)
     lines = r.b.ready_log()
@@ -340,7 +353,7 @@ def _turn(r: _Rig, how: str = "abort", timeout_s: float = 300) -> list:
     msgs = r.assign(timeout_s)
     time.sleep(DRIVE_S)
     r.decline(how, msgs)
-    time.sleep(LOOK_S + 0.3)
+    at_rest(r)
     assert r.b.on_ready() == ""
     collect(r.a, msgs, turned)
     return msgs

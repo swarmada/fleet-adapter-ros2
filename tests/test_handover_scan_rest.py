@@ -354,7 +354,11 @@ def test_with_the_scan_on_and_showing_rest_an_estop_is_still_failed_on_command_d
     control.start()
     try:
         assert cp.opened.wait(2.0)
-        time.sleep(sr.LAG_S + sr.WINDOW_S + 0.3)
+        # The scan's full look, on the feeder's own scans: waited for, not slept, so a feeder
+        # that lags on a loaded runner delays the test instead of failing it.
+        end = time.monotonic() + sr.LAG_S + sr.WINDOW_S + 10.0
+        while time.monotonic() < end and b.handover_at_rest(ROBOT) != (True, ""):
+            time.sleep(0.02)
         assert b.handover_at_rest(ROBOT) == (True, "")          # the scan shows rest
         _driving(a, b, server, cp)
         safety = threading.Thread(target=a.run_safety_stream, args=(_SafetyStub(),),
