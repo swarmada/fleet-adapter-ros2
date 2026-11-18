@@ -277,8 +277,7 @@ def test_an_edge_estop_before_accept_takes_the_same_path(monkeypatch):
     _assign(a)
     h = _Handle()
     _answer_later(b, sent[0], h, after=0.1)
-    a._edge_addr.put("edge:1")
-    a._edge_loop()
+    a._edge_stream("edge:1")
     _no_motion_after_the_stop(b, sent, h)
     msgs = []
     req = stubs[0].requests

@@ -136,10 +136,11 @@ class RobotBinding(Protocol):
         thread, without the adapter's robot lock (some callers hold its lease lock), and MUST
         NOT block.
 
-        If it raises when the SafetyStream is lost, the adapter tries it again, every 50 ms
-        for the 2 s stop budget and then every second, until it goes out, new work takes the
-        robot, or the adapter shuts down, and refuses new work meanwhile. The lost action's
-        report says whether it went out within the budget; a later success is logged."""
+        If it raises when the SafetyStream is lost, or an estop from the EdgeStream or the drill
+        raises, the adapter tries it again, every 50 ms for the 2 s stop budget and then every
+        second, until it goes out, a later loss or estop takes the retry over, or the adapter
+        shuts down, and refuses new work meanwhile. The lost action's report says whether it
+        went out within the budget; a later success is logged."""
 
     def stop_settled(self, robot_id: str, timeout: float) -> bool:
         """After a stop: wait up to ``timeout`` s until nothing the stop was meant to end can
