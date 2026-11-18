@@ -167,7 +167,11 @@ that this adapter did not send is cancelled by its id. If the adapter's goal fai
 cancelled, this goes on until its next goal or explorer start, or a stop: the server ends the
 adapter's goal when a later goal preempts it. To drive the robot by hand while it is managed,
 use a manual-drive or navigate-handover assignment, not a goal of your own. While the robot is
-idle, after a goal that succeeded, other goals are left alone.
+idle, after a goal that succeeded, other goals are left alone, with one exception: for a few
+seconds after a goal that superseded an explore segment, until that segment's explorer has been
+ended and has settled, other senders' goals are still cancelled. A goal the explorer sent as it
+was told to stop, and the server accepted late, could otherwise drive the robot with no
+assignment.
 
 ### The edge estop latch
 

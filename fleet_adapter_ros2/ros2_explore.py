@@ -676,6 +676,13 @@ class Ros2ExploreStack:
                    "async_slam_toolbox_node")
         self._slam_launched = self._keepout_launched = False
         self._reset_at = None
+        # The explorer is ended: once the settle has passed, none of its goals can still
+        # arrive, and a goal that superseded the segment stops guarding past its SUCCEEDED.
+        try:
+            self.binding.explorer_ended(self.robot_id, EXPLORER_SETTLE_S)
+        except Exception as exc:  # noqa: BLE001 - a stop path: report, never raise
+            print(f"explore-floor: telling the binding the explorer ended raised "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
     def battery_mv(self) -> float | None:
         v = self.binding.latest_battery(self.robot_id).voltage
