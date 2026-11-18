@@ -300,6 +300,25 @@ def _fast_retries(monkeypatch) -> None:
     monkeypatch.setattr(adapter_mod, "_SAFETY_STOP_RETRY_S", 0.02)
 
 
+_RETRY_THREADS = ("safety-lost-report", "estop-stop-retry")
+
+
+@pytest.fixture(autouse=True)
+def _retries_end_with_their_test(monkeypatch):
+    """A test's stop retry ends before the next test starts. A retry ended by its adapter's
+    shutdown logs SAFETY_STOP_RETRY_ENDED as it goes, and a late one landed in the next test's
+    captured stderr, failing a test that asserts no retry of its own ended. This waits up to 2 s
+    for the retry threads the test started. It depends on `monkeypatch`, so it is torn down
+    first, while the test's fast retry interval still holds."""
+    before = set(threading.enumerate())
+    yield
+    end = time.monotonic() + 2.0
+    while time.monotonic() < end and any(
+            t.is_alive() and t.name in _RETRY_THREADS and t not in before
+            for t in threading.enumerate()):
+        time.sleep(0.01)
+
+
 def test_a_stop_that_raises_once_is_tried_again_and_reported_stopped(monkeypatch):
     _fast_retries(monkeypatch)
     robot = _StopRaises(fail=1)
