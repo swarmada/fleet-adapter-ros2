@@ -4,7 +4,7 @@
 """C13.1: AdapterHello reports a contract_version inside the range the control plane accepts.
 
 The window is N and N-1 minor within the current major (ADR-0032). The control plane
-implements contract 1.3.0, so it accepts ">=1.2.0 <1.4.0" and refuses registration for
+implements contract 1.4.0, so it accepts ">=1.3.0 <1.5.0" and refuses registration for
 anything outside it. This adapter claims 1.3.0: it meets 1.2.0's obligations (the
 FA-R5/FA-R6 decline, and a scan answered with its action catalog) and answers 1.3.0's one
 addition, the zone_constraints push, rather than declining it. The claim is written out
@@ -20,7 +20,7 @@ from fleet_adapter_ros2.adapter import fleet_adapter_ros2Adapter as Adapter
 from fleet_adapter_ros2.robot import SimulatedRobot
 
 # The control plane's contract version, and the window derived from it.
-PLANE = (1, 3)
+PLANE = (1, 4)
 WINDOW = [(PLANE[0], PLANE[1] - 1), PLANE]
 
 
