@@ -60,7 +60,7 @@ if not hasattr(FenceGuard, "adopt"):
     raise ImportError("swarmada_sdk.safety.FenceGuard has no adopt(): this adapter needs a "
                       "swarmada-sdk that can adopt the control plane's fencing token")
 
-from fleet_adapter_ros2 import explore, handover, manual_drive
+from fleet_adapter_ros2 import __version__, explore, handover, manual_drive
 from fleet_adapter_ros2 import task as task_map  # noqa: E402
 from fleet_adapter_ros2.robot import SimulatedRobot  # noqa: E402
 from fleet_adapter_ros2.watchdog import (  # noqa: E402
@@ -223,14 +223,16 @@ _END_CAUSE_BY_CANCEL_CAUSE = {
 
 
 # The fleet-adapter CONTRACT version this adapter implements (ADR-0032). Distinct from
-# adapter_version (this build) and protocol_version (the wire package identity, not a semver, which
-# is why it cannot express compatibility). A control plane refuses REGISTRATION for an adapter that
-# reports nothing or reports out of range, so this is not optional -- telemetry, heartbeat and
-# emergency stop keep working either way. Bump it only when this adapter is re-qualified against a
-# new contract (`make conformance`), and update the adapters/REGISTRY.md row with it.
+# adapter_version (this build, `__version__`, whose first two numbers are this version's) and
+# protocol_version (the wire package identity, not a semver, which is why it cannot express
+# compatibility). A control plane refuses REGISTRATION for an adapter that reports nothing or
+# reports out of range, so this is not optional -- telemetry, heartbeat and emergency stop keep
+# working either way. Bump it only when this adapter is re-qualified against a new contract
+# (`make conformance`), bump `__version__` and pyproject.toml's version with it, and update the
+# adapters/REGISTRY.md row.
 #
-# 1.3.0 IS A CLAIM, AND THIS IS WHAT MAKES IT TRUE. The control plane implements 1.3.0 and
-# accepts ">=1.2.0 <1.4.0" (N and N-1 minor, ADR-0032); the conformance harness derives the same
+# 1.3.0 IS A CLAIM, AND THIS IS WHAT MAKES IT TRUE. The control plane implements 1.4.0 and
+# accepts ">=1.3.0 <1.5.0" (N and N-1 minor, ADR-0032); the conformance harness derives the same
 # window. This adapter declared 1.0.0 until it met the obligations below, and was refused
 # registration VERSION_MISMATCH for as long as the window excluded it. Raising the string alone
 # would have claimed a contract it did not implement.
@@ -257,8 +259,10 @@ _END_CAUSE_BY_CANCEL_CAUSE = {
 #     state. This adapter declined the push, and declared 1.2.0, until it did this; declaring
 #     1.3.0 while declining it would have asserted an adoption it had not made.
 #
-# 1.3.0 is the version a 1.3.0 control plane implements; it stays inside the window until the
-# control plane implements 1.5.0, so re-qualify before then.
+# 1.3.0 is N-1 to a 1.4.0 control plane: it stays inside the window until the control plane
+# implements 1.5.0, so re-qualify at 1.4.0 before then. The conformance harness, like a 1.4.0
+# control plane that requires the stop latch, gives a 1.3.x connection no assignment, so the
+# checks that need one are recorded skipped for this adapter.
 #
 # What no version here covers: C3.7, the fencing high-water mark surviving a process restart. The
 # mark is held in memory, as in every reference adapter, and the harness records C3.7 SKIP.
@@ -605,7 +609,7 @@ class fleet_adapter_ros2Adapter:  # noqa: N801  (generated class name)
     def _control_requests(self) -> Iterator:
         pb = self._pb
         yield pb.AdapterMessage(hello=pb.AdapterHello(  # C1.2
-            vendor="ros2", adapter_version="0.1.0",
+            vendor="ros2", adapter_version=__version__,
             protocol_version="fleet_adapter.v1", contract_version=CONTRACT_VERSION,
             namespace=self._namespace))
         while True:
